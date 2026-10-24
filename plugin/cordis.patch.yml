@@ -1,0 +1,12 @@
+- insert:
+    - id: sts2-agent-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sts2
+        transport: stdio
+        command: 'C:\Users\Lenovo\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
+        args:
+          - 'C:\Users\Lenovo\Documents\deepseek-harness\default-workspace\sts2agent\plugin\server.mjs'
+        env:
+          STS2_BRIDGE: http://127.0.0.1:47821
+        failOnStartupError: true

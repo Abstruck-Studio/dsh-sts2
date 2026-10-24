@@ -1,0 +1,10 @@
+﻿# build / 临时产物
+bin/
+obj/
+*.user
+*.suo
+node_modules/
+.vs/
+
+# 本地日志
+*.log

@@ -1,0 +1,12 @@
+{
+  "id": "Sts2AgentBridge",
+  "name": "StS2 Agent Bridge",
+  "author": "DSH",
+  "description": "Local HTTP bridge that exposes Slay the Spire 2 run/combat state and lets an external agent submit player actions.",
+  "version": "0.1.0",
+  "hasPck": false,
+  "hasDll": true,
+  "affectsGameplay": true,
+  "minGameVersion": "0.107.0",
+  "dependencies": []
+}
