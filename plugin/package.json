@@ -1,12 +1,21 @@
 {
   "name": "@local/sts2-agent",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "exports": {
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["cordis.patch.yml", "server.mjs", "locale/*.json", "icon.svg"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "files": [
+    "cordis.patch.yml",
+    "server.mjs",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
 }

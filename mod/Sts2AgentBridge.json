@@ -3,7 +3,7 @@
   "name": "StS2 Agent Bridge",
   "author": "DSH",
   "description": "Local HTTP bridge exposing run/combat state and accepting player actions from an external agent.",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "has_pck": false,
   "has_dll": true,
   "min_game_version": "0.107.0",

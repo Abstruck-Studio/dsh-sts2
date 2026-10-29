@@ -8,7 +8,7 @@ namespace Sts2AgentBridge;
 
 /// <summary>
 /// Watches the visible screen from the main-thread pump and records a small event whenever
-/// the screen signature changes. An external consumer polls GET /events instead of polling the
+/// the screen signature changes. The live director polls GET /events instead of polling the
 /// game state itself. The feed is a bounded in-memory ring; it never blocks the main thread
 /// and is written from the main thread / read from HTTP threads under one lock.
 /// </summary>

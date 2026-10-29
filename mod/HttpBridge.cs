@@ -18,6 +18,10 @@ namespace Sts2AgentBridge;
 public static class HttpBridge
 {
     public const int Port = 47821;
+
+    /// <summary>桥自报的版本号（/health 用）。要和 mod/Sts2AgentBridge.json 的 version 同步改。</summary>
+    public const string ModVersion = "0.3.1";
+
     private static TcpListener _listener;
     private static readonly CancellationTokenSource Cts = new();
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
@@ -144,6 +148,37 @@ public static class HttpBridge
         };
     }
 
+    /// <summary>轮询到「房间变了或地图页开了」。**必须在 HTTP 线程调用**（内部用 OnMain）。</summary>
+    private static async Task<bool> WaitScreenChange(string roomBefore, int timeoutMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                if (await BridgePump.OnMain(ScreenApi.IsMapOpen, 2000)) return true;
+                var room = await BridgePump.OnMain(ScreenApi.CurrentRoomName, 2000);
+                if (!string.Equals(room, roomBefore, StringComparison.Ordinal)) return true;
+            }
+            catch { return false; }
+            await Task.Delay(100);
+        }
+        return false;
+    }
+
+    /// <summary>轮询到地图页真的打开。</summary>
+    private static async Task<bool> WaitMapOpen(int timeoutMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            try { if (await BridgePump.OnMain(ScreenApi.IsMapOpen, 2000)) return true; }
+            catch { return false; }
+            await Task.Delay(100);
+        }
+        return false;
+    }
+
     private static async Task<(int Status, string Payload)> Dispatch(Request request)
     {
         var path = request.Path.Split('?')[0].TrimEnd('/');
@@ -159,7 +194,8 @@ public static class HttpBridge
                         ["ok"] = true,
                         ["attached"] = BridgePump.IsAttached,
                         ["mod"] = "Sts2AgentBridge",
-                        ["version"] = "0.1.0",
+                        // 和 Sts2AgentBridge.json 的 version 保持一致（两处都改，别只改一处）。
+                        ["version"] = ModVersion,
                     }));
 
                 case "/state":
@@ -259,14 +295,40 @@ public static class HttpBridge
                         return (200, Json(await BridgePump.OnMain(RunAttach.AttachCurrentRun, 15000)));
                     }
 
+                // /relics（复数）= 玩家身上全部遗物；必须单独一个 case ——
+                // 写进 /relic 的 case 里是匹配不到的（switch 匹配的是 path 本身）。
+                case "/relics":
+                    return (200, Json(await BridgePump.OnMain(DataApi.Relics)));
+
                 case "/relic":
                 case "/potion":
                     {
                         var query = request.Path.Contains('?') ? request.Path[(request.Path.IndexOf('?') + 1)..] : string.Empty;
                         var pairs = query.Split('&').Select(part => part.Split('=', 2)).Where(p => p.Length == 2).ToList();
                         var id = pairs.Where(p => p[0] == "id").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
+                        // 奖励/商店只给中文名时按 title 查（和 /card 一致）。
+                        var title = pairs.Where(p => p[0] == "title").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
                         var isRelic = request.Path.StartsWith("/relic");
-                        return (200, Json(await BridgePump.OnMain(() => isRelic ? DataApi.Relic(id) : DataApi.Potion(id))));
+                        return (200, Json(await BridgePump.OnMain(() => isRelic ? DataApi.Relic(id, title) : DataApi.Potion(id, title))));
+                    }
+
+                case "/power":
+                    {
+                        var query = request.Path.Contains('?') ? request.Path[(request.Path.IndexOf('?') + 1)..] : string.Empty;
+                        var pairs = query.Split('&').Select(part => part.Split('=', 2)).Where(p => p.Length == 2).ToList();
+                        var id = pairs.Where(p => p[0] == "id").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
+                        var title = pairs.Where(p => p[0] == "title").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
+                        return (200, Json(await BridgePump.OnMain(() => DataApi.Power(id, title))));
+                    }
+
+                // 整副牌（/state 只给 deckSize）。客户端算防御/AOE/诅咒/升级数与删牌优先级。
+                case "/deck":
+                    {
+                        var query = request.Path.Contains('?') ? request.Path[(request.Path.IndexOf('?') + 1)..] : string.Empty;
+                        var pairs = query.Split('&').Select(part => part.Split('=', 2)).Where(p => p.Length == 2).ToList();
+                        var player = pairs.Where(p => p[0] == "player")
+                            .Select(p => int.TryParse(p[1], out var v) ? v : 0).FirstOrDefault();
+                        return (200, Json(await BridgePump.OnMain(() => GameApi.DeckView(player))));
                     }
 
                 case "/card":
@@ -274,8 +336,12 @@ public static class HttpBridge
                         var query = request.Path.Contains('?') ? request.Path[(request.Path.IndexOf('?') + 1)..] : string.Empty;
                         var pairs = query.Split('&').Select(part => part.Split('=', 2)).Where(p => p.Length == 2).ToList();
                         var id = pairs.Where(p => p[0] == "id").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
-                        int? uid = pairs.Where(p => p[0] == "uid").Select(p => int.TryParse(p[1], out var v) ? v : (int?)null).FirstOrDefault();
-                        return (200, Json(await BridgePump.OnMain(() => DataApi.Card(id, uid))));
+                        // uid 用 long：界面控件 id 是 60 位 ulong，用 int 解析会静默变成 null，
+                        // 然后回一句误导的「missing id or uid」。
+                        long? uid = pairs.Where(p => p[0] == "uid")
+                            .Select(p => long.TryParse(p[1], out var v) ? v : (long?)null).FirstOrDefault();
+                        var title = pairs.Where(p => p[0] == "title").Select(p => Uri.UnescapeDataString(p[1])).FirstOrDefault();
+                        return (200, Json(await BridgePump.OnMain(() => DataApi.Card(id, uid, title))));
                     }
 
                 // /choices、/choose（按索引选牌）已删除：选牌走 /request + /respond。
@@ -403,8 +469,61 @@ public static class HttpBridge
                         return (200, Json(await BridgePump.OnMain(() => ScreenApi.Tap(uid))));
                     }
 
+                case "/close-overlay":
+                    {
+                        if (request.Method != "POST") return (405, Json(new { ok = false, error = "POST required" }));
+                        return (200, Json(await BridgePump.OnMain(ScreenApi.CloseOverlay)));
+                    }
+
                 case "/proceed":
-                    return (200, Json(await BridgePump.OnMain(ScreenApi.Proceed)));
+                    {
+                        // 有没结算的奖励时不许推进：Boss 奖励会晚 2~3 秒弹屏，这段空档里点前进
+                        // 会把整批奖励跳掉（实测 2026-10-26）。force:true 只在奖励确实拿不了时用。
+                        var force = false;
+                        try
+                        {
+                            using var body = JsonDocument.Parse(string.IsNullOrWhiteSpace(request.Body) ? "{}" : request.Body);
+                            force = body.RootElement.TryGetProperty("force", out var f) && f.ValueKind == JsonValueKind.True;
+                        }
+                        catch { }
+
+                        if (!force && await BridgePump.OnMain(RequestApi.UnclaimedRewardsPending))
+                        {
+                            return (200, Json(new Dictionary<string, object>
+                            {
+                                ["ok"] = false,
+                                ["rewardsPending"] = true,
+                                ["error"] = "还有没结算的奖励（Boss 奖励有时晚 2~3 秒才弹屏）：先 sts2_request 等 rewards 出现，别用 proceed 跳过",
+                                ["hint"] = "等 0.5~1 秒再 sts2_request；真拿不了就在 rewards 请求上 picks:[]（= 离开奖励）。"
+                                         + "确实卡死才用 sts2_proceed {force:true}",
+                            }));
+                        }
+
+                        // 两段式：先点房间自己的前进键，**真的变了**才算成功（实测商店里前进键
+                        // 虽然可用、点了却不推进）。没变化就退回到顶栏地图按钮——玩家开地图就是点它，
+                        // 而 `move` 只在地图页有效。
+                        var roomBefore = await BridgePump.OnMain(ScreenApi.CurrentRoomName);
+                        var clicked = await BridgePump.OnMain(ScreenApi.Proceed);
+                        if (await WaitScreenChange(roomBefore, 2500))
+                            return (200, Json(clicked));
+
+                        var mapTry = await BridgePump.OnMain(ScreenApi.OpenMapPage);
+                        var mapOpened = await WaitMapOpen(2500);
+                        var dict = new Dictionary<string, object>
+                        {
+                            ["ok"] = mapOpened,
+                            ["method"] = mapOpened ? "NTopBarMapButton.ForceClick" : "none",
+                            ["proceed"] = clicked,
+                            ["mapAttempt"] = mapTry,
+                            ["roomBefore"] = roomBefore,
+                            ["room"] = await BridgePump.OnMain(ScreenApi.CurrentRoomName),
+                            ["mapOpen"] = mapOpened,
+                        };
+                        dict["hint"] = mapOpened
+                            ? "地图页已打开：现在用 sts2_move（move 只在地图页有效）"
+                            : "没打开地图页：先看 sts2_request 有没有待答请求；商店面板还开着就先 picks:[] 关掉";
+                        return (200, Json(dict));
+                    }
 
                 // ---- 存档并退出 / 重新读档（重开本局）----
                 // 都是「游戏自己的入口」：SaveManager.SaveRun + NGame.ReturnToMainMenu，

@@ -78,6 +78,42 @@ public static class GameApi
         return d;
     }
 
+    /// <summary>
+    /// 整副牌（不只手牌），每张用和手牌同一个 CardDto。以前 /state 只给 deckSize，
+    /// agent 看不到牌组里到底是什么牌，牌组健康度（防御/AOE/诅咒/升级）全是猜的。
+    /// 只读：不排队动作、不改游戏状态。
+    /// </summary>
+    public static Dictionary<string, object> DeckView(int playerIndex = 0)
+    {
+        var rm = RunManager.Instance;
+        if (rm == null || !rm.IsInProgress)
+            return new Dictionary<string, object> { ["ok"] = false, ["error"] = "not in run" };
+
+        var state = rm.DebugOnlyGetState();
+        if (state?.Players == null || state.Players.Count == 0)
+            return new Dictionary<string, object> { ["ok"] = false, ["error"] = "no players" };
+
+        var index = Math.Clamp(playerIndex, 0, state.Players.Count - 1);
+        var player = state.Players[index];
+        var cards = new List<object>();
+        var deck = player.Deck?.Cards;
+        if (deck != null)
+            foreach (var card in deck) cards.Add(CardDto(card));
+
+        // 手牌张数单独给：牌组张数在战斗里含手牌，客户端要能区分「牌组」和「这手牌」。
+        int hand;
+        try { hand = player.PlayerCombatState?.Hand?.Cards?.Count ?? 0; } catch { hand = 0; }
+
+        return new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["player"] = index,
+            ["deckSize"] = cards.Count,
+            ["handSize"] = hand,
+            ["cards"] = cards,
+        };
+    }
+
     private static Dictionary<string, object> Combat(CombatState cs, int playerCount)
     {
         var d = new Dictionary<string, object>
@@ -136,6 +172,8 @@ public static class GameApi
             {
                 ["id"] = pw.Id?.ToString(),
                 ["amount"] = pw.Amount,
+                // 中文名（agent 看到「神器2」比 POWER.ARTIFACT_POWER:2 好判断）；全文案走 /power。
+                ["title"] = DataApi.SafeText(pw.Title),
             }).ToList<object>(),
             ["freeAttacks"] = p.Creature?.Powers?
                 .Where(pw => pw.Id?.ToString()?.Contains("FREE_ATTACK") == true)
@@ -358,6 +396,7 @@ public static class GameApi
         {
             ["id"] = p.Id?.ToString(),
             ["amount"] = p.Amount,
+            ["title"] = DataApi.SafeText(p.Title),
         }).ToList<object>(),
     };
 
@@ -798,6 +837,8 @@ public static class GameApi
             if (s?.CurrentRoom == null) return false;
             roomType = s.CurrentRoom.RoomType.ToString();
             if (roomType == "Map") return false;
+            // `move` 只在地图页触发（用户口径 + 实测）：商店面板关掉 ≠ 已经在地图页，
+            // 所以这里不给商店开口子；关完面板后用 /proceed（必要时会点顶栏地图按钮）把地图页打开。
             if (MapScreenOpen()) return false;
             if (RoomUiPresent()) return true;
             return roomType != "Combat" && roomType != "Monster"
@@ -807,6 +848,28 @@ public static class GameApi
         {
             return false;
         }
+    }
+
+    /// <summary>商店面板是不是还开着（NMerchantInventory.IsOpen）。读不到就当没开。</summary>
+    internal static bool ShopInventoryOpen()
+    {
+        try
+        {
+            if (Godot.Engine.GetMainLoop() is not Godot.SceneTree tree) return false;
+            var stack = new System.Collections.Generic.Stack<Godot.Node>();
+            stack.Push(tree.Root);
+            var visited = 0;
+            while (stack.Count > 0 && visited++ < 20000)
+            {
+                var node = stack.Pop();
+                if (node is MegaCrit.Sts2.Core.Nodes.Screens.Shops.NMerchantInventory inv
+                    && Godot.GodotObject.IsInstanceValid(inv) && inv.IsOpen)
+                    return true;
+                foreach (var child in node.GetChildren()) stack.Push(child);
+            }
+            return false;
+        }
+        catch { return false; }
     }
 
     /// <summary>地图界面是不是开着（NMapScreen.Instance.IsOpen）。</summary>

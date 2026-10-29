@@ -157,7 +157,15 @@ public static partial class RequestApi
 
     // ---- 奖励通道（NRewardsScreen） ----
     /// <summary>奖励请求的 prompt：一条说清「可以都拿，也可以一项都不拿」。</summary>
-    private const string RewardPrompt = "战斗奖励：选择要领取的项目（可以都拿，也可以不要）";
+    private const string RewardPrompt = "战斗奖励：想领就 picks=[项目 key…]；领完了 / 都不要就 picks:[] 关闭奖励屏（也可以选「离开奖励#1」）";
+
+    /// <summary>奖励屏的显式出口。`picks:[]` 已经是「全跳过并关屏」，这个是给它一个可读的名字。</summary>
+    private const string RewardLeaveTitle = "离开奖励";
+    private const string RewardLeaveKey = RewardLeaveTitle + "#1";
+    private const string RewardLeaveDetail = "跳过剩下所有奖励并关闭奖励屏（药水槽满、拿不了时用它）";
+
+    /// <summary>奖励还没弹屏（结算空档）时的 stage：只用来占位等待，不 accepts 选择。</summary>
+    private const string RewardStageIncoming = "incoming";
 
     /// <summary>每领一项之间停这么久：让奖励项自己的动画（遗物飞进背包 / 药水飞进槽位）看得见。</summary>
     private const int RewardGapMs = 320;
@@ -193,7 +201,16 @@ public static partial class RequestApi
 
     // ---- 商店通道（NMerchantInventory） ----
     /// <summary>商店请求的 prompt：一条说清「可以都买、也可以一件都不买」。</summary>
-    private const string ShopPrompt = "商店：选择要买的东西（中途也可以不买）";
+    /// <summary>
+    /// items 阶段：picks 是商品；<c>picks:[]</c> 或「离开商店#1」= 关掉面板回地图。
+    /// 以前 <c>picks:[]</c> 只表示「这次不买」，面板不关、前进键又禁用 → 死锁。
+    /// </summary>
+    private const string ShopPrompt = "商店：想买就 picks=[商品 key…]；买完了 / 不买了就 picks:[] 离开（关闭面板回地图），也可以选「离开商店#1」";
+    private const string ShopLeaveTitle = "离开商店";
+    private const string ShopLeaveKey = ShopLeaveTitle + "#1";
+
+    /// <summary>已主动关掉面板的商店节点：关掉之后别再发 stage=closed 请求把 agent 拉回去。</summary>
+    private static ulong _shopDismissedFor;
 
     /// <summary>
     /// 每买一件之间停这么久：商店格子自己会播「买走 / 售罄」表现（由
@@ -312,6 +329,9 @@ public static partial class RequestApi
     /// <summary>阶段 2 的 prompt：遗物已经摆出来，可以拿一件，也可以不拿（直接离开）。</summary>
     private const string TreasurePrompt = "宝箱：要拿走哪件（picks:[] = 都不拿，直接离开）";
 
+    /// <summary>空宝箱（白银熔炉）：没有遗物可拿，给一个「继续」出口。</summary>
+    private const string TreasureEmptyPrompt = "空宝箱：没有遗物可拿（例如白银熔炉）—— picks:[] 或「继续#1」前进离开";
+
     /// <summary>阶段 1 唯一候选的标题（key 就是「标题#1」）。</summary>
     private const string TreasureOpenTitle = "打开宝箱";
 
@@ -323,6 +343,17 @@ public static partial class RequestApi
 
     /// <summary><c>pending.stage</c>：箱子已开、遗物摆出来了（阶段 2）。</summary>
     private const string TreasureStageRelics = "relics";
+
+    /// <summary><c>pending.stage</c>：空宝箱（箱子已开、但永远不会有遗物陈列，例如白银熔炉）。</summary>
+    private const string TreasureStageEmpty = "empty";
+
+    /// <summary>空宝箱的出口候选（动作，不是遗物）。</summary>
+    private const string TreasureLeaveTitle = "继续";
+    private const string TreasureLeaveKey = TreasureLeaveTitle + "#1";
+
+    /// <summary>「箱子开了但遗物格子一直没摆出来」要等这么久才判成空宝箱（避开 3s 开箱动画）。</summary>
+    private const ulong TreasureEmptyGraceMs = 1200;
+    private static ulong _treasureEmptySinceMs;
 
     /// <summary>
     /// 开箱最多等这么久。<c>NTreasureRoom.OpenChest()</c> 在 <c>InitializeRelics()</c> +
@@ -625,6 +656,7 @@ public static partial class RequestApi
         public string Signature;   // 奖励通道：界面+奖励集合+候选的指纹，变了就换 id
         public Node Screen;        // NRewardsScreen（商店通道里是 NMerchantInventory）
         public RewardsSet RewardSet;
+        public string RewardStage;   // incoming（奖励还没弹屏，等待中）/ 正常奖励列表不设此字段
 
         // ---- 商店通道专用 ----
         public int ShopGold;       // 这次请求发出时的金币（/request 的 pending.gold）
@@ -1773,14 +1805,56 @@ public static partial class RequestApi
         if (Engine.GetMainLoop() is not SceneTree tree) return null;
 
         var screen = FindFirst(tree.Root, "NRewardsScreen");
-        if (screen == null)
+        if (screen == null || !IsShown(screen))
         {
-            // 界面消失 = 这批奖励结束：待答请求和「已发出」记录一起清掉，别留僵尸请求。
+            // Boss 奖励有时比战斗结束晚 2~3 秒才弹屏。这段空档以前什么都不发，
+            // agent 看到 pending:null 就 proceed 把奖励整批跳过（实测 2026-10-26）。
+            // 现在发一条「还在结算」的等待请求，并且 proceed 通道/路由都会拦住。
+            if (UnclaimedRewardsPending())
+            {
+                var wait = _rewardsPending;
+                if (wait == null || !string.Equals(wait.RewardStage, RewardStageIncoming, StringComparison.Ordinal))
+                {
+                    wait = new PendingSelection
+                    {
+                        Id = NextId(),
+                        Min = 0,
+                        Max = 0,
+                        Kind = "reward",
+                        Caller = "NRewardsScreen",
+                        Prompt = "奖励马上弹出（Boss 奖励会晚 2~3 秒）：稍等再 GET /request；不要用 proceed 跳过",
+                        RewardStage = RewardStageIncoming,
+                        CreatedUtc = DateTime.UtcNow,
+                    };
+                    _rewardsPending = wait;
+                    BridgeLog.Info($"rewards: 奖励结算中（界面还没弹），发等待请求 id={wait.Id}");
+                }
+
+                return new Dictionary<string, object>
+                {
+                    ["id"] = wait.Id,
+                    ["kind"] = "reward",
+                    ["stage"] = RewardStageIncoming,
+                    ["prompt"] = wait.Prompt,
+                    ["min"] = 0,
+                    ["max"] = 0,
+                    ["requireConfirm"] = false,
+                    ["cancelable"] = true,
+                    ["caller"] = wait.Caller,
+                    ["route"] = "rewards",
+                    ["candidates"] = new List<object>(),
+                    ["note"] = "等 0.5~1 秒再读；奖励屏出现后会变成 stage:\"rewards-list\"",
+                };
+            }
+
+            // 界面消失 / 被隐藏 = 这批奖励结束：待答请求和「已发出」记录一起清掉，别留僵尸请求。
+            // （实测：sts2_tap 点了屏幕外的「跳过」后游戏已经离开，但这里只判 null 时节点还在树上，
+            //  于是挂回一个幽灵 pending，/respond 永远失败、/proceed 被挡住 —— 加 IsShown 自愈。）
             var stale = _rewardsPending;
             if (stale != null)
             {
                 _rewardsPending = null;
-                BridgeLog.Info($"rewards: 界面消失，清掉请求 id={stale.Id}");
+                BridgeLog.Info($"rewards: 界面已消失/隐藏，清掉请求 id={stale.Id}");
             }
             ClearRewardDispatched();
             return null;
@@ -1800,13 +1874,18 @@ public static partial class RequestApi
             ClearRewardDispatched();
         }
 
-        var candidates = CollectRewardCandidates(screen, set);
-        if (candidates.Count == 0)
+        var rewards = CollectRewardCandidates(screen, set);
+        if (rewards.Count == 0)
         {
             // 只剩「跳过 / 继续」：不是奖励选择，回 pending:null（推进由 /proceed 负责）。
             DropRewardsPending("没有未领的奖励项（只剩跳过/继续）");
             return null;
         }
+
+        // 「离开奖励#1」是动作候选，不是奖励项：放在最后；Max 仍然只数奖励项。
+        // 药水槽满、唯一奖励拿不了时，这条是唯一的出口（以前 picks:[] 之后屏不关，原地循环）。
+        var candidates = new List<Candidate>(rewards) { RewardLeaveCandidate() };
+        var rewardCount = rewards.Count;
 
         var signature = RewardSignature(screen, set, candidates);
         var state = _rewardsPending;
@@ -1815,8 +1894,8 @@ public static partial class RequestApi
             state = new PendingSelection
             {
                 Id = NextId(),
-                Min = 0,                      // 可以一项都不要（picks:[] = 全部跳过）
-                Max = candidates.Count,       // 也可以全要
+                Min = 0,                      // 可以一项都不要（picks:[] = 全部跳过并关屏）
+                Max = rewardCount,            // 也可以全要（「离开奖励」不占名额）
                 Kind = "reward",
                 Caller = "NRewardsScreen",
                 Prompt = RewardPrompt,
@@ -1836,7 +1915,7 @@ public static partial class RequestApi
             state.Screen = screen;
             state.RewardSet = set;
             state.Min = 0;
-            state.Max = candidates.Count;
+            state.Max = rewardCount;
             state.Cards = candidates;
         }
 
@@ -1860,6 +1939,65 @@ public static partial class RequestApi
         ["route"] = "rewards",
         ["candidates"] = pending.Cards.Select(CandidateJson).ToList(),
     };
+
+    /// <summary>奖励屏的「离开」候选：跳过剩余奖励并关闭奖励屏（药水槽满时的唯一出口）。</summary>
+    private static Candidate RewardLeaveCandidate() => new()
+    {
+        Key = RewardLeaveKey,
+        Title = RewardLeaveTitle,
+        Upgraded = false,
+        Cost = -1,
+        ItemType = "Action",
+        Stable = "leave",
+        Enabled = true,
+        Detail = RewardLeaveDetail,
+    };
+
+    private static bool IsRewardLeavePick(string raw)
+    {
+        var s = (raw ?? "").Trim();
+        if (s.Length == 0) return false;
+        return string.Equals(s, RewardLeaveKey, StringComparison.Ordinal)
+            || string.Equals(s, RewardLeaveTitle, StringComparison.Ordinal)
+            || string.Equals(s, "leave", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 还有没有「没结算完」的奖励。Boss 奖励会晚 2~3 秒才弹屏：这段空档里
+    /// <c>GetNextRewardIds()</c> 已经有 id、但界面还没出来 —— 用它拦住 proceed / 推进通道。
+    /// </summary>
+    internal static bool UnclaimedRewardsPending()
+    {
+        try
+        {
+            var sync = RunManager.Instance?.RewardsSetSynchronizer;
+            if (sync == null) return false;
+
+            // 只在「刚打完的战斗房间」里认这件事。GetNextRewardIds() 会把**将来**的奖励 id
+            // 也算进来（实测：人已经回到 Map，它仍然非空），不加房间约束会在地图上一直报
+            // stage:"incoming"，agent 就一直等奖励、不敢走。
+            var state = RunManager.Instance?.DebugOnlyGetState();
+            var room = state?.CurrentRoom;
+            if (room == null) return false;
+            var roomType = room.RoomType.ToString();
+            if (roomType != "Monster" && roomType != "Elite" && roomType != "Boss" && roomType != "Combat")
+                return false;
+
+            var ids = sync.GetNextRewardIds();
+            if (ids == null) return false;
+            var player = state?.Players?.FirstOrDefault();
+            foreach (var id in ids)
+            {
+                try
+                {
+                    if (player == null || !sync.IsRewardsSetCompleted(player, id)) return true;
+                }
+                catch { return true; }
+            }
+            return false;
+        }
+        catch { return false; }
+    }
 
     /// <summary>奖励界面的候选：就是 <c>RewardsSet.Rewards</c>（成组的展开），已领的剔掉。</summary>
     private static List<Candidate> CollectRewardCandidates(Node screen, RewardsSet set)
@@ -2114,6 +2252,27 @@ public static partial class RequestApi
     /// </summary>
     private static async Task<Dictionary<string, object>> AnswerRewards(PendingSelection pending, string[] picks)
     {
+        // 「奖励还没弹屏」的等待请求：什么都不做，只把它摘掉让下一轮重新探。
+        if (string.Equals(pending.RewardStage, RewardStageIncoming, StringComparison.Ordinal))
+        {
+            _rewardsPending = null;
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["route"] = "rewards",
+                ["stage"] = RewardStageIncoming,
+                ["applied"] = "（奖励还没弹屏，什么都没做）",
+                ["note"] = "等 0.5~1 秒再 GET /request；奖励屏出现后按正常 rewards 答",
+            };
+        }
+
+        // 「离开奖励#1」= 跳过剩余奖励并关屏（和 picks:[] 同一条路）。
+        if (picks != null && picks.Any(IsRewardLeavePick))
+        {
+            if (picks.Length > 1) return Fail("「离开奖励」要单独选：别和奖励项放进同一次应答");
+            picks = Array.Empty<string>();
+        }
+
         var failure = Validate(pending.Min, pending.Max, pending.Cards, picks, out var chosen, "项");
         if (failure != null) return failure;      // 校验没过：请求还在槽里，本来就能再答
 
@@ -2517,6 +2676,29 @@ public static partial class RequestApi
 
         if (why != null) return Fail("全部跳过失败：" + why);
 
+        // 界面收尾：NRewardsScreen 不是 IOverlayScreen，上面那段 Remove 对它是空操作 ——
+        // 这就是「picks:[] 之后奖励屏不关、原地出现新 id」的根因。等一会儿，还在就点它自己的
+        // 跳过 / 继续键（和玩家点那个按钮同一条路），再等它消失。
+        var closed = await WaitRewardsScreenGone(screen, 800);
+        if (!closed)
+        {
+            try
+            {
+                var clicked = await BridgePump.OnMain(() =>
+                {
+                    var btn = FindRewardsLeaveControl(screen);
+                    if (btn == null) return false;
+                    btn.ForceClick();
+                    BridgeLog.Info("rewards: 收尾点了一次界面自己的跳过/继续键");
+                    return true;
+                }, 3000);
+                if (!clicked) BridgeLog.Warn("rewards: 找不到跳过/继续键，界面可能还开着");
+            }
+            catch (Exception e) { BridgeLog.Warn("rewards: 收尾点击失败：" + e.Message); }
+            closed = await WaitRewardsScreenGone(screen, 1800);
+        }
+        if (!closed) BridgeLog.Warn("rewards: 跳过之后奖励屏仍在（收尾没成功，下一次 /request 会如实反映）");
+
         // 留一点时间让界面淡出/收尾，别让 agent 立刻轮询到「同一个界面还在」。
         await Task.Delay(RewardGapMs);
 
@@ -2526,14 +2708,64 @@ public static partial class RequestApi
             ["ok"] = true,
             ["source"] = "screen",
             ["route"] = "rewards",
-            ["applied"] = "（全部跳过）",
+            ["applied"] = "（全部跳过并关屏）",
             ["how"] = "reward-skip-set",
             ["animated"] = true,
             ["waitedMs"] = sw.ElapsedMilliseconds,
             ["visual"] = "reward-skipped",
+            ["closed"] = closed,
             ["claimed"] = 0,
-            ["skipped"] = pending.Cards.Count,
+            ["skipped"] = pending.Cards.Count(c => !IsRewardLeavePick(c.Key)),
+            ["hint"] = closed ? "奖励屏已关" : "奖励屏可能还开着：再看一次 sts2_request；还开着就按提示选「离开奖励#1」",
         };
+    }
+
+    /// <summary>等奖励屏真的消失/隐藏。</summary>
+    private static async Task<bool> WaitRewardsScreenGone(Node screen, int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            bool shown;
+            try { shown = await BridgePump.OnMain(() => IsShown(screen), 2000); }
+            catch { return true; }
+            if (!shown) return true;
+            await Task.Delay(80);
+        }
+        return false;
+    }
+
+    /// <summary>奖励屏里「跳过 / 继续 / proceed」那个键（按类型或文案认，不点坐标）。</summary>
+    internal static NClickableControl FindRewardsLeaveControl(Node root)
+    {
+        if (root == null) return null;
+        var stack = new Stack<Node>();
+        stack.Push(root);
+        var visited = 0;
+        while (stack.Count > 0 && visited++ < 20000)
+        {
+            var node = stack.Pop();
+            if (node is NClickableControl clickable)
+            {
+                try
+                {
+                    if (clickable.IsVisibleInTree())
+                    {
+                        if (node is MegaCrit.Sts2.Core.Nodes.CommonUi.NProceedButton) return clickable;
+                        var name = "";
+                        try { name = clickable.Name?.ToString() ?? ""; } catch { }
+                        if (name.Length > 0
+                            && (name.Contains("skip", StringComparison.OrdinalIgnoreCase)
+                                || name.Contains("proceed", StringComparison.OrdinalIgnoreCase)
+                                || name.Contains("continue", StringComparison.OrdinalIgnoreCase)))
+                            return clickable;
+                    }
+                }
+                catch { }
+            }
+            foreach (var child in node.GetChildren()) stack.Push(child);
+        }
+        return null;
     }
 
     /// <summary>等一个游戏任务，但最多等 ms；返回 done / timeout / faulted。</summary>
@@ -2710,12 +2942,20 @@ public static partial class RequestApi
             // 注意这条只挡新增的 closed 阶段，items 阶段（面板真打开着）保持原行为不变。
             if (!ShopRoomPresent(out var roomWhy))
             {
+                _shopDismissedFor = 0;      // 已经不在商店里了：下一间商店重新算
                 DropShopPending("当前房间不是商店（" + roomWhy + "）");
                 return null;
             }
 
             ulong nodeId = 0;
             try { nodeId = node.GetInstanceId(); } catch { }
+
+            // 刚才主动「离开商店」关掉了面板：玩家还没走出房间，别再弹一条「要不要打开」。
+            if (nodeId != 0 && nodeId == _shopDismissedFor)
+            {
+                DropShopPending("商店面板已被主动关闭（等玩家离开房间）");
+                return null;
+            }
             if (_shopClosedLoggedFor != nodeId)
             {
                 _shopClosedLoggedFor = nodeId;
@@ -2764,13 +3004,15 @@ public static partial class RequestApi
         // ================= 阶段 2：面板已打开（原有逻辑） =================
         _shopClosedLoggedFor = 0;
 
-        var items = CollectShopCandidates(node, inventory, gold);
-        if (items.Count == 0)
-        {
-            // 全买光了 / 全售罄：没有可买的，就不是决策（离开商店用 /proceed）。
-            DropShopPending("没有可买的条目（都售罄或者已经买光）");
-            return null;
-        }
+        var goods = CollectShopCandidates(node, inventory, gold);
+
+        // 「离开商店」是动作候选，不是商品：即使全买光/全售罄也要给这个出口，
+        // 否则面板开着、前进键禁用、又没有可答请求 = 死锁。
+        var items = new List<Candidate>(goods) { ShopLeaveCandidate() };
+        var goodsCount = goods.Count;
+        var maxPicks = Math.Max(1, goodsCount);
+        if (goodsCount == 0)
+            BridgeLog.Info("shop: 没有可买的条目，只发「离开商店」出口");
 
         var itemsSignature = ShopSignature(node, ShopStageItems, items);
         var itemsState = _shopPending;
@@ -2779,8 +3021,8 @@ public static partial class RequestApi
             itemsState = new PendingSelection
             {
                 Id = NextId(),
-                Min = 0,                      // 一件都不买永远合法
-                Max = items.Count,
+                Min = 0,                      // 一件都不买永远合法（= 离开）
+                Max = maxPicks,
                 Kind = "shop",
                 Caller = "NMerchantInventory",
                 Prompt = ShopPrompt,
@@ -2800,7 +3042,7 @@ public static partial class RequestApi
             // 同一份请求：只刷新节点引用和金币（玩家可能刚自己买了一件，签名变了才会换 id）。
             itemsState.Screen = node;
             itemsState.Min = 0;
-            itemsState.Max = items.Count;
+            itemsState.Max = maxPicks;
             itemsState.Cards = items;
             itemsState.ShopGold = gold;
             itemsState.ShopStage = ShopStageItems;
@@ -3203,6 +3445,16 @@ public static partial class RequestApi
         if (string.Equals(pending.ShopStage, ShopStageClosed, StringComparison.Ordinal))
             return await AnswerShopOpen(pending, picks);
 
+        // 离开商店：picks:[] 或明确选「离开商店#1」= 关掉面板回地图。
+        // 以前 picks:[] 只表示「这次不买」，面板不关、前进键又禁用 → 原地再造一条同样的请求（死锁）。
+        var leavePicked = picks != null && picks.Any(IsShopLeavePick);
+        if (leavePicked || picks == null || picks.Length == 0)
+        {
+            if (picks != null && picks.Length > 1)
+                return Fail("「离开商店」要单独选：别把商品和它放进同一次应答");
+            return await AnswerShopLeave(pending);
+        }
+
         var failure = Validate(pending.Min, pending.Max, pending.Cards, picks, out var chosen, "项");
         if (failure != null) return failure;      // 校验没过：请求还在槽里，本来就能再答
 
@@ -3247,6 +3499,164 @@ public static partial class RequestApi
         // 药水槽满 / 金币不够 / 已售出 / 界面不在这些情况下，agent 都能改一道答案再答同一个 id。
         if (!IsTrue(result, "ok")) RestoreShopAfterReject(pending);
         return result;
+    }
+
+    /// <summary>「离开商店」的几种写法：候选 key、稳定 id、标题。</summary>
+    private static bool IsShopLeavePick(string raw)
+    {
+        var s = (raw ?? "").Trim();
+        if (s.Length == 0) return false;
+        return string.Equals(s, ShopLeaveKey, StringComparison.Ordinal)
+            || string.Equals(s, ShopLeaveTitle, StringComparison.Ordinal)
+            || string.Equals(s, "leave", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Candidate ShopLeaveCandidate() => new()
+    {
+        Key = ShopLeaveKey,
+        Title = ShopLeaveTitle,
+        Upgraded = false,
+        Cost = -1,
+        ItemType = "Action",
+        Stable = "leave",
+        Enabled = true,
+        Detail = "关闭商店面板、回到地图（等于面板自己的返回键；之后用 sts2_proceed 离开房间）",
+    };
+
+    /// <summary>
+    /// 关掉商店面板。按「游戏自己的入口」逐级尝试，全失败才报错（不谎报成功）：
+    /// ① 面板里的 <c>NBackButton</c>（NMerchantInventory 场景自带 backButton，就是玩家的返回键）
+    /// ② 面板里名字像 返回/关闭/离开 的可见可点控件
+    /// ③ 房间的前进按钮（只在它已经可用时点；面板开着时它是禁用的）
+    /// </summary>
+    private static async Task<(bool Closed, string How, string Why)> TryCloseShopPanel(NMerchantInventory node)
+    {
+        if (node == null) return (false, "none", "没有商店面板节点");
+
+        try
+        {
+            var back = await BridgePump.OnMain(
+                () => FindVisibleNode<MegaCrit.Sts2.Core.Nodes.CommonUi.NBackButton>(node), 3000);
+            if (back != null)
+            {
+                await BridgePump.OnMain(() => { back.ForceClick(); return true; }, 3000);
+                if (await WaitShopClosed(node, 2500)) return (true, "back-button", null);
+                BridgeLog.Warn("shop close: 点了返回键但 IsOpen 还是 true");
+            }
+        }
+        catch (Exception e) { BridgeLog.Warn("shop close: 返回键这条路失败：" + e.Message); }
+
+        try
+        {
+            var hit = await BridgePump.OnMain(() => FindShopCloseControl(node), 3000);
+            if (hit != null)
+            {
+                await BridgePump.OnMain(() => { hit.ForceClick(); return true; }, 3000);
+                if (await WaitShopClosed(node, 2500)) return (true, "close-control", null);
+            }
+        }
+        catch (Exception e) { BridgeLog.Warn("shop close: 关控件这条路失败：" + e.Message); }
+
+        try
+        {
+            var room = MegaCrit.Sts2.Core.Nodes.Rooms.NMerchantRoom.Instance;
+            var btn = room?.ProceedButton;
+            if (btn != null && btn.Visible && btn.IsEnabled)
+            {
+                await BridgePump.OnMain(() => { btn.ForceClick(); return true; }, 3000);
+                if (await WaitShopClosed(node, 2500)) return (true, "proceed-button", null);
+            }
+        }
+        catch (Exception e) { BridgeLog.Warn("shop close: 前进按钮这条路失败：" + e.Message); }
+
+        return (false, "none", "面板的返回键 / 关控件 / 前进键都没能让 IsOpen 变 false");
+    }
+
+    /// <summary>面板子树里第一个「名字像返回/关闭」的可见可点控件。</summary>
+    private static NClickableControl FindShopCloseControl(Node root)
+    {
+        if (root == null) return null;
+        var stack = new Stack<Node>();
+        stack.Push(root);
+        var visited = 0;
+        while (stack.Count > 0 && visited++ < 40000)
+        {
+            var node = stack.Pop();
+            if (node is NClickableControl clickable)
+            {
+                var name = "";
+                try { name = clickable.Name?.ToString() ?? ""; } catch { }
+                if (name.Length > 0
+                    && (name.Contains("back", StringComparison.OrdinalIgnoreCase)
+                        || name.Contains("close", StringComparison.OrdinalIgnoreCase)
+                        || name.Contains("leave", StringComparison.OrdinalIgnoreCase)
+                        || name.Contains("返回") || name.Contains("关闭") || name.Contains("离开")))
+                {
+                    try { if (clickable.IsVisibleInTree()) return clickable; } catch { }
+                }
+            }
+            foreach (var child in node.GetChildren()) stack.Push(child);
+        }
+        return null;
+    }
+
+    /// <summary>等商店面板真的关上（<c>IsOpen=false</c> 或节点被释放）。</summary>
+    private static async Task<bool> WaitShopClosed(NMerchantInventory node, int timeoutMs)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            bool open;
+            try
+            {
+                open = await BridgePump.OnMain(
+                    () => node != null && GodotObject.IsInstanceValid(node) && SafeIsOpen(node), 2000);
+            }
+            catch { return true; }
+            if (!open) return true;
+            await Task.Delay(80);
+        }
+        return false;
+    }
+
+    /// <summary>应答「离开商店」：关面板 → 清 pending → 记下这个节点，别再弹「要不要打开」。</summary>
+    private static async Task<Dictionary<string, object>> AnswerShopLeave(PendingSelection pending)
+    {
+        var sw = Stopwatch.StartNew();
+        _shopPending = null;
+        _lastAnsweredId = pending.Id;
+
+        var node = pending.Screen as NMerchantInventory;
+        ulong nodeId = 0;
+        try { nodeId = node?.GetInstanceId() ?? 0; } catch { }
+        if (nodeId != 0) _shopDismissedFor = nodeId;
+
+        var (closed, how, why) = await TryCloseShopPanel(node);
+        if (!closed)
+        {
+            _shopDismissedFor = 0;
+            RestoreShopAfterReject(pending);       // 没关掉就把请求挂回去，别谎报成功
+            return Fail("没能关掉商店面板：" + why + "。面板还开着，可以再答一次。");
+        }
+
+        BridgeLog.Info($"shop answered id={pending.Id} 离开商店（how={how} gold={pending.ShopGold}）");
+        return new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["source"] = "screen",
+            ["route"] = "shop",
+            ["stage"] = "left",
+            ["applied"] = "离开商店（面板已关闭）",
+            ["how"] = "shop-leave-" + how,
+            ["animated"] = false,
+            ["closed"] = true,
+            ["waitedMs"] = sw.ElapsedMilliseconds,
+            ["visual"] = "shop-left",
+            ["bought"] = 0,
+            ["gold"] = pending.ShopGold,
+            ["note"] = "面板已关；离开房间用 sts2_proceed（这时前进键应该可用了），或直接 sts2_move",
+            ["items"] = new List<object>(),
+        };
     }
 
     /// <summary>
@@ -4337,6 +4747,7 @@ public static partial class RequestApi
         if (room == null)
         {
             // 离开宝箱房 = 这次领取结束：待答请求一起清掉，别留僵尸请求。
+            _treasureEmptySinceMs = 0;
             DropTreasurePending("宝箱房界面不在场景树里（已经离开宝箱房）");
             return null;
         }
@@ -4365,13 +4776,10 @@ public static partial class RequestApi
             return null;
         }
 
+        // 注意：**不能**因为 CurrentRelics 为空就 return —— 空宝箱（白银熔炉）从一开始就是空的，
+        // 那样连「打开宝箱」这一步都发不出去，箱子永远打不开（实测 2026-10-26）。
+        // 空不空由下面的开箱状态判定，relics 只在「已开且陈列中」时才必须非空。
         var relics = CurrentTreasureRelics(sync);
-        if (relics.Count == 0)
-        {
-            // 空箱 / 已经拿走：CurrentRelics 被 EndRelicVoting / CompleteWithNoRelics 置空。
-            DropTreasurePending("宝箱里没有待拿的遗物（空箱，或者已经拿走了）");
-            return null;
-        }
 
         // ---- 阶段判定（两个 bool 都来自 NTreasureRoom 的 private 字段，MetaPriv 核对过）----
         var view = ReadTreasureRoomView(room);
@@ -4388,6 +4796,13 @@ public static partial class RequestApi
         // 再置 _hasChestBeenOpened，两者之间没有 await，但按这个顺序判断更稳）。
         if (view.CollectionOpen)
         {
+            _treasureEmptySinceMs = 0;
+            if (relics.Count == 0)
+            {
+                // 陈列开着但没有遗物：已经拿走了（EndRelicVoting 会清 CurrentRelics）。
+                DropTreasurePending("遗物已经拿走（陈列里没有待拿的遗物）");
+                return null;
+            }
             // 阶段 2：箱子已开、遗物格子摆出来了 —— 这时才给出真正的内容。
             stage = TreasureStageRelics;
             candidates = CollectTreasureCandidates(relics);
@@ -4399,21 +4814,36 @@ public static partial class RequestApi
         }
         else if (!view.ChestOpened)
         {
+            _treasureEmptySinceMs = 0;
             // 阶段 1：箱子还关着 —— 只问「要不要打开」，不暴露箱里的东西。
             stage = TreasureStageChestClosed;
             candidates = new List<Candidate> { TreasureOpenCandidate() };
         }
         else
         {
-            // 箱子开过、但遗物格子还没摆出来 = 开箱动画还在播（3s 左右）。
-            // 这时候候选还没摆出来，**绝不发**阶段 2 请求，这一轮就当没有请求。
-            DropTreasurePending("开箱动画还没播完（_isRelicCollectionOpen 还是 false），等下一轮");
-            return null;
+            // 箱子开过、但遗物格子一直不摆出来。两种可能：
+            //   (a) 开箱动画还在播（3s 左右）→ 这一轮当没有请求；
+            //   (b) **空宝箱**（白银熔炉：第一个宝箱是空的）→ 永远不会有遗物陈列。
+            // 老逻辑把 (b) 也当成「动画没播完」无限 drop，于是 pending=null + 前进键禁用 = 卡死
+            // （实测 2026-10-26）。等过宽限期就发一个「继续#1」出口。
+            var now = Time.GetTicksMsec();
+            if (_treasureEmptySinceMs == 0) _treasureEmptySinceMs = now;
+            if (now - _treasureEmptySinceMs < TreasureEmptyGraceMs)
+            {
+                DropTreasurePending("开箱动画还没播完（_isRelicCollectionOpen 还是 false），等下一轮");
+                return null;
+            }
+
+            stage = TreasureStageEmpty;
+            candidates = new List<Candidate> { TreasureLeaveCandidate() };
+            BridgeLog.Info("treasure: 空宝箱（箱子已开但一直没有遗物陈列）→ 发「继续#1」出口");
         }
 
         var prompt = string.Equals(stage, TreasureStageChestClosed, StringComparison.Ordinal)
             ? TreasureOpenPrompt
-            : TreasurePrompt;
+            : string.Equals(stage, TreasureStageEmpty, StringComparison.Ordinal)
+                ? TreasureEmptyPrompt
+                : TreasurePrompt;
         var min = string.Equals(stage, TreasureStageChestClosed, StringComparison.Ordinal) ? 1 : 0;
         var max = string.Equals(stage, TreasureStageChestClosed, StringComparison.Ordinal)
             ? 1
@@ -4456,6 +4886,28 @@ public static partial class RequestApi
         }
 
         return DescribeTreasurePendingJson(state);
+    }
+
+    /// <summary>空宝箱的出口候选：不是遗物，只是「前进/继续」。</summary>
+    private static Candidate TreasureLeaveCandidate() => new()
+    {
+        Key = TreasureLeaveKey,
+        Title = TreasureLeaveTitle,
+        Upgraded = false,
+        Cost = -1,
+        ItemType = "Action",
+        Stable = "leave",
+        Enabled = true,
+        Detail = "空宝箱：没有遗物可拿，点前进离开房间",
+    };
+
+    private static bool IsTreasureLeavePick(string raw)
+    {
+        var s = (raw ?? "").Trim();
+        if (s.Length == 0) return false;
+        return string.Equals(s, TreasureLeaveKey, StringComparison.Ordinal)
+            || string.Equals(s, TreasureLeaveTitle, StringComparison.Ordinal)
+            || string.Equals(s, "leave", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -4648,6 +5100,8 @@ public static partial class RequestApi
     {
         if (string.Equals(pending.TreasureStage, TreasureStageChestClosed, StringComparison.Ordinal))
             return await AnswerTreasureOpen(pending, picks);
+        if (string.Equals(pending.TreasureStage, TreasureStageEmpty, StringComparison.Ordinal))
+            return await AnswerTreasureEmpty(pending, picks);
 
         var failure = Validate(pending.Min, pending.Max, pending.Cards, picks, out var chosen, "件");
         if (failure != null) return failure;      // 校验没过：请求还在槽里，本来就能再答
@@ -4678,6 +5132,56 @@ public static partial class RequestApi
         // 任何 ok:false 都不是「已经答过了」：把请求挂回槽里、清掉回答标记。
         if (!IsTrue(result, "ok")) RestoreTreasureAfterReject(pending);
         return result;
+    }
+
+    /// <summary>
+    /// 空宝箱的应答：picks:[] 或「继续#1」= 点前进离开房间。
+    /// 空宝箱没有遗物可陈列，<c>_isRelicCollectionOpen</c> 永远不会变 true —— 这里不碰遗物，只推进房间。
+    /// </summary>
+    private static async Task<Dictionary<string, object>> AnswerTreasureEmpty(PendingSelection pending, string[] picks)
+    {
+        picks ??= Array.Empty<string>();
+        if (picks.Length > 1) return Fail($"空宝箱只能选 1 个动作，你给了 {picks.Length} 个");
+        if (picks.Length == 1)
+        {
+            var k = (picks[0] ?? "").Trim();
+            if (!IsTreasureLeavePick(k))
+                return Fail($"{k} 不在候选里（空宝箱只有「{TreasureLeaveKey}」；picks:[] 也等于继续）");
+        }
+
+        var sw = Stopwatch.StartNew();
+        _treasurePending = null;
+        _lastAnsweredId = pending.Id;
+
+        var clicked = await BridgePump.OnMain(ScreenApi.Proceed);
+        var changed = false;
+        var deadline = sw.ElapsedMilliseconds + 2500;
+        while (sw.ElapsedMilliseconds < deadline)
+        {
+            var room = await BridgePump.OnMain(ScreenApi.CurrentRoomName);
+            if (!string.Equals(room, "Treasure", StringComparison.Ordinal)) { changed = true; break; }
+            await Task.Delay(120);
+        }
+
+        if (!changed)
+        {
+            RestoreTreasureAfterReject(pending);
+            return Fail("空宝箱：点了前进但房间还没变（前进键可能还没亮）。稍等再答一次，或先 sts2_proceed。");
+        }
+
+        BridgeLog.Info($"treasure answered id={pending.Id} 空宝箱：继续/前进成功");
+        return new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["source"] = "screen",
+            ["route"] = "treasure",
+            ["stage"] = "left",
+            ["applied"] = "空宝箱：没有遗物可拿，已前进",
+            ["how"] = "treasure-empty-proceed",
+            ["closed"] = true,
+            ["waitedMs"] = sw.ElapsedMilliseconds,
+            ["proceed"] = clicked,
+        };
     }
 
     /// <summary>
@@ -9215,6 +9719,13 @@ public static partial class RequestApi
             return null;
         }
 
+        // 还有没结算的奖励：这条「跳过#1」会把奖励整批跳掉（Boss 奖励就死在这一步，实测 2026-10-26）。
+        if (UnclaimedRewardsPending())
+        {
+            DropProceedPending("还有没结算的奖励（Boss 奖励会晚 2~3 秒弹屏），先不挂「跳过」");
+            return null;
+        }
+
         var signature = ProceedSignature(view);
         var state = _proceedPending;
         if (state == null || !string.Equals(state.Signature, signature, StringComparison.Ordinal))
@@ -10052,15 +10563,23 @@ public static partial class RequestApi
             return Fail(DescribeCount(effectiveMin, effectiveMax, picks.Length, unit));
 
         var list = new List<Candidate>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<Candidate>();
         foreach (var raw in picks)
         {
             var key = (raw ?? "").Trim();
             if (key.Length == 0) return Fail("picks 里有空的 key");
-            var cand = candidates.FirstOrDefault(c => string.Equals(c.Key, key, StringComparison.Ordinal));
+
+            // 认三种写法：key（标题#序号）、Stable（商店的 slot:N）、模型 id（CARD.X / RELIC.X …）。
+            // 候选现在同时带 id / modelId，模型可能直接把它抄回来；按模型 id 也认，
+            // 免得「字段能读出、却答不回去」这种自相矛盾的接口。
+            var cand = candidates.FirstOrDefault(c => string.Equals(c.Key, key, StringComparison.Ordinal))
+                    ?? candidates.FirstOrDefault(c => !string.IsNullOrEmpty(c.Stable)
+                        && string.Equals(c.Stable, key, StringComparison.OrdinalIgnoreCase))
+                    ?? candidates.FirstOrDefault(c => string.Equals(CandidateModelId(c), key, StringComparison.OrdinalIgnoreCase));
+
             if (cand == null)
                 return Fail($"{key} 不在候选里（可选：{DescribeKeys(candidates)}）");
-            if (!seen.Add(key))
+            if (!seen.Add(cand))
                 return Fail($"{key} 重复了，同一张牌不能选两次");
             list.Add(cand);
         }
@@ -11805,7 +12324,61 @@ public static partial class RequestApi
             dict["treasureIndex"] = c.TreasureIndex;
         }
 
+        // ---- 模型 id + 卡面文字 ----
+        // 以前选牌候选只有中文 title，而 /card 只认 id：模型无法把「主宰」变成 CARD.MASTERY，
+        // 只能靠猜（实测就是这么卡住的）。这里统一补 modelId，并在缺 detail 时带牌面文字。
+        try
+        {
+            var modelId = CandidateModelId(c);
+            if (!string.IsNullOrEmpty(modelId))
+            {
+                dict["modelId"] = modelId;
+                if (!dict.ContainsKey("id")) dict["id"] = modelId;
+            }
+            if (c.Card != null && MissingDetail(dict))
+            {
+                var text = DataApi.CardText(c.Card);
+                if (!string.IsNullOrEmpty(text)) dict["detail"] = text;
+            }
+            if (c.Card != null)
+            {
+                // 升级预览（只给变了的数值）：营火锻造 / 武装 / 奖励三选一时能直接比较。
+                var preview = DataApi.UpgradeDelta(c.Card);
+                if (preview != null) dict["upgradePreview"] = preview;
+            }
+        }
+        catch { }
+
         return dict;
+    }
+
+    /// <summary>候选背后的模型 id（CARD.X / RELIC.X / POTION.X），拿不到就 null。</summary>
+    private static string CandidateModelId(Candidate c)
+    {
+        try
+        {
+            if (c.Card != null) return c.Card.Id?.ToString();
+            if (c.RelicRef != null) return c.RelicRef.Id?.ToString();
+            if (c.RewardRef is RelicReward rr) return rr.Relic?.Id?.ToString();
+            if (c.RewardRef is PotionReward pr) return pr.Potion?.Id?.ToString();
+            if (c.Entry != null)
+            {
+                switch (c.Entry)
+                {
+                    case MerchantRelicEntry re: return re.Model?.Id?.ToString();
+                    case MerchantPotionEntry pe: return pe.Model?.Id?.ToString();
+                    case MerchantCardEntry ce: return ce.CreationResult?.Card?.Id?.ToString();
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static bool MissingDetail(Dictionary<string, object> dict)
+    {
+        if (!dict.TryGetValue("detail", out var value)) return true;
+        return string.IsNullOrWhiteSpace(value as string);
     }
 
     private static string DescribeCount(int min, int max, int given, string unit = "张")

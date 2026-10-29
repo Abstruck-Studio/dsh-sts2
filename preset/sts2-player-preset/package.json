@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "杀戮尖塔2 纯游戏 agent 预设：只负责打牌",
+  "description": "杀戮尖塔2 纯游戏 agent 预设：只打牌，不带直播/弹幕能力",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

@@ -159,7 +159,7 @@ method RewardCollectedFrom(Godot.Control) / RewardSkippedFrom(Godot.Control)
 
 > 现有 `mcp__sts2__sts2_move` 工具就是 `(col,row)` 语义，和 `MapCoord` 完全一致 —— D1 其实已经做完了，协议里只需要把 kind 名字对齐。
 >
-> **2026-10-23 实机修复**：`move` 以前是 fire-and-forget（永远 `ok:true`），现在 `GameApi.MoveAndConfirm`
+> **2026-10-23 直播实测修复**：`move` 以前是 fire-and-forget（永远 `ok:true`），现在 `GameApi.MoveAndConfirm`
 > 会等 `EnterMapCoord` 这个 Task 并轮询主线程，只有「目标坐标到了 **且** `CurrentRoom` 换成了另一个实例」才回
 > `ok:true`。失败回结构化错误 + 完整 `available`（照抄 `NMapScreen.RecalculateTravelability`：visited 为空 →
 > 起点节点；最后一行 → Boss；否则 `MapTravel.GetTravelablePointsFrom`）。`EnterMapCoordInternal` 的 NRE 根因是
@@ -2026,7 +2026,7 @@ agent 走图一直在「试」坐标：它只有一堆 `points` 坐标，看不�
 
 - 只做了离线核对（`sts2agent\tmp\MapProbe`）：`MapPoint.AddChildPoint` 确实双向写
   `Children` / `parents`、`MapCoord` 的 `(col,row)` 顺序、`EdgeName` 四个方向、`legend` 覆盖全枚举。
-- 真实一局里的 `/map` / `/map/next` JSON **没有**在游戏里跑过（当时不允许重启游戏），
+- 真实一局里的 `/map` / `/map/next` JSON **没有**在游戏里跑过（直播中，不允许启游戏），
   所以 `rows` / `boss.row` 的实际数字、以及 `visited` 的时序都还没实测。
 
 

@@ -19,6 +19,8 @@ You pilot the game through a mod that runs inside the game process. All tools ta
    powershell -NoProfile -ExecutionPolicy Bypass -File sts2agent\scripts\launch-game.ps1 [-Deploy]
    ```
 2. `sts2_state`，然后 `sts2_request` —— 停在菜单/开始界面时用 `kind:"menu"` 走完，不点坐标。
+   进战斗后改用 `sts2_view`（一次给出 ANCHOR / EFF / BLOCK_POOL / ORDER / COPIES / 手牌 key），
+   别拿原始 `/state` 自己心算伤害。
 
 ## 开局流程：menu 一路走到底
 
@@ -191,7 +193,7 @@ Rules for the memory files:
 - 开局先读根 `memory.md` + 本角色 `memory.md`：照「好的决策」打，避开「坏的决策」。
 - 进阶写在角色文件头 `> 当前进阶：N / 未确认`：从低往高、不跳段，只有在该档**通关**才 +1，
   死亡不动，没确认过就写「未确认」按进阶 0 开局。
-- 控制台侧 `POST /api/run-end` 可以往 `guide/<角色>/memory.md` 追加一条
+- 直播链路里这些是自动写的：控制台 `POST /api/run-end` 会往 `guide/<角色>/memory.md` 追加一条
   （通关写「好的决策」、死亡写「坏的决策」），通关时顺便把「当前进阶」+1。那种场合不用自己写文件。
 
 ## State is pushed to you — don't poll
@@ -209,6 +211,11 @@ So the loop is: receive a push → decide → call the action tools → wait for
 Only call `sts2_state` when you genuinely lost track (e.g. after a long tool detour), not every
 turn — a stale read is worse than the pushed snapshot because it may describe an older board.
 
+The push has no damage math. When the turn needs the numbers (multiple enemies, 易伤/多段/斩杀线,
+or "can my hand block this"), follow the push with ONE `sts2_view`: it returns the incoming total,
+per-card damage against each enemy, `BLOCK_POOL`, `ORDER` and `COPIES`. Use `sts2_state` only when
+you need raw JSON fields that `sts2_view` does not print.
+
 If two pushes arrive back to back, the later one wins.
 
 ## Fast paths — one call instead of three
@@ -218,15 +225,18 @@ before trying them.
 
 | Goal | Do exactly this |
 |---|---|
-| Play a turn | `sts2_acts({actions:[{play_card,uid,target}, … , {end_turn}]})` — one call, 2–4 cards, verify `energy` in the returned turn |
+| Play a turn | `sts2_acts({actions:[{kind:"play_card",card:"打击#2",target:0}, …, {kind:"end_turn"}]})` — one call, 2–4 cards；`card` 用 `sts2_view` 给的 `标题#序号`（比 uid/下标稳），verify `energy` in the returned turn |
 | End turn with nothing useful | `sts2_acts({actions:[{end_turn}]})` |
-| Take a reward | `sts2_request` → `{"kind":"reward","stage":"rewards-list"}` → `sts2_respond {id, picks:[key]}`（`picks:[]` = 都跳过）. 领到卡牌奖励后会接着来一条 `stage:"card-choice"`，同样用 respond 回答，或 `picks:[]` 放弃 |
+| Take a reward | `sts2_request` → `{"kind":"reward","stage":"rewards-list"}` → `sts2_respond {id, picks:[key]}`（**`picks:[]` = 跳过剩余并关屏**，返回里看 `closed`；药水槽满就选候选里的「离开奖励#1」）。领到卡牌奖励后会接着来一条 `stage:"card-choice"`，同样用 respond 回答，或 `picks:[]` 放弃 |
 | Discard / exhaust / upgrade a card | `sts2_request` → `{"kind":"...","candidates":[{key,title}]}` → `sts2_respond {id, picks:["打击#2"]}`；成功是 `ok:true` + `applied` |
 | Multi-pick screen | one `sts2_respond` with several keys: `{id, picks:["打击#1","防御#2"]}`（min/max 由请求给出）|
 | Leave a node | `sts2_move` with a coord from `sts2_map_next` 的 `canMove`（= `/map` 的 `available`）—— 别猜 |
-| 看整张图 / 定路线 | 每幕只做一次：`sts2_map` 拿全图 → 自己按 `children/parents` 定路线并说出来；之后每步 `sts2_map_next` 取 `canMove` |
-| Buy in a shop | `sts2_request` → `{"kind":"shop","stage":"closed"}` → `sts2_respond {id,picks:["打开商店#1"]}` 打开面板 → 下一次 `/request` 给 `stage:"items"`（每项带 price/affordable/detail）→ `sts2_respond {id,picks:[key]}` 购买 |
+| 看整张图 / 定路线 | 每幕开头一次：`sts2_route`（直接给 opt 排名 + 符号序列 + `ELITE_GATE`）→ `sts2_route {commit:<opt>, note:"…"}` 记计划 → 之后每个节点先 `sts2_plan`（`PLAN_OK` 走 / `REPLAN` 重排）；`canMove` 永远来自 `sts2_map_next` |
+| Buy in a shop | `sts2_request` → `{"kind":"shop","stage":"closed"}` → `sts2_respond {id,picks:["打开商店#1"]}` 打开面板 → 下一次 `/request` 给 `stage:"items"`（每项带 price/affordable/detail/modelId）→ `sts2_respond {id,picks:[key]}` 购买；**买完/不买了就 `picks:[]` 离开**（关面板，返回 stage:"left"），再 `sts2_proceed` 或直接 `sts2_move` |
 | Drink / throw a potion | `sts2_potions` 拿 `key` → `sts2_use_potion({potion:"力量药水#1", target?})` / `sts2_discard_potion({potion:"..."})`；需要目标时返回 `needTarget:true` + 一条 `kind:"potion"` 请求，用 respond 选目标或 `picks:[]` 取消 |
+| 不认识的能力 / 看全部遗物 | `sts2_power {id:"POWER.SLIPPERY_POWER"}`（或 `{title:"滑溜"}`）；`sts2_relics` 一次列全自己身上的遗物（带 title/description） |
+| 有覆层挡住界面 | `sts2_close_overlay` 关栈顶（地图/奖励屏/商店面板/牌库/选牌网格），返回新的 `layerStack`；`sts2_screen` 里先看 `layerStack` 判断谁在最上面 |
+| 评估升级收益 | `sts2_card_info {id}` 的 `upgraded` 块，或直接用候选上的 `upgradePreview`（只列变了的数值） |
 | Start a run | `sts2_request` → `{"kind":"menu","stage":"main"}` → respond 单人模式 → `stage:"mode"` → 标准模式 → `stage:"character"` → `"silent#1"` → `stage:"ascension"` 选 `Ascension N#1`（N ≤ `ascensionMax`，N 看 `guide/<角色>/memory.md` 的「当前进阶」）；全程不点坐标，答完 ascension 才真正开局 |
 
 Rules that cut the round-trips:
@@ -247,7 +257,8 @@ Rules that cut the round-trips:
 
 ## `/start` 已禁用：开新局只能走菜单协议
 
-`POST /start`（`sts2_start` 工具）**现在直接返回错误，而且不会造任何东西**。原因（实测）：
+`POST /start`（`sts2_start` 工具）**默认直接返回 `REFUSED`，一个请求都不会发出去**
+（只有启动 DSH 前设了 `STS2_ALLOW_START=1` 才会放行）。原因（实测）：
 
 ```
 它只建对局模型、不生成地图、不切场景
@@ -277,8 +288,8 @@ GET /request → kind:"menu"
 
 | 目的 | 调用 |
 |---|---|
-| 存盘并回主菜单 | `POST /save-quit` → `{ok,saved,room:"MainMenu",hasRunSave,wasRoom,wasFloor,…}` |
-| 读档继续 | `POST /reload` → `{ok,inRun:true,how:"continue-button",…}` |
+| 存盘并回主菜单 | `sts2_save_quit`（= `POST /save-quit`）→ `{ok,saved,room:"MainMenu",hasRunSave,wasRoom,wasFloor,…}` |
+| 读档继续 | `sts2_reload`（= `POST /reload`）→ `{ok,inRun:true,how:"continue-button",…}` |
 
 做出错误决策（选错牌、走错路、关键药水丢了）时：`/save-quit` 存盘回主菜单 → `/reload` 读档
 继续。**不要杀进程**：那会丢 Steamworks 状态，下次还得等一分钟桥接。
@@ -297,9 +308,9 @@ GET /request → kind:"menu"
 
 ```
 menu        主菜单/模式/角色/进阶页（stage: main / mode / character / ascension）
-reward      战斗奖励（stage: rewards-list 选要拿的项；stage: card-choice 三选一，picks:[] 可放弃）
-treasure    宝箱（stage: chest-closed 先开箱 → stage: relics 再决定拿不拿）
-shop        商店（stage: closed 先开门 → stage: items 买；picks:[] 不买）
+reward      战斗奖励（stage: rewards-list 选要拿的项；picks:[] = 跳过剩余并关屏；stage: card-choice 三选一，picks:[] 可放弃）
+treasure    宝箱（stage: chest-closed 先开箱 → stage: relics 再决定拿不拿 → stage: empty 空箱，给「继续#1」出口）
+shop        商店（stage: closed 先开门 → stage: items 买；picks:[] = 离开商店并关闭面板，返回 stage:"left"）
 rest        营火（休息/锻造/挖掘…选项全是动态的，看 candidates）
 event       事件选项（detail 有完整效果说明；isProceed=true 是「离开」）
 gameover    死亡/胜利收尾页（stage: summary → page；「继续」→「主菜单」，零坐标走完）
@@ -321,11 +332,48 @@ bundle 的两个细节（实测）：
 
 占卜怎么打：`kind:"divination"`，只挑 `revealed:false` 的格子（翻过的别再翻，一样扣次数）；`divinationsLeft` 到 0 时游戏会自己转成 reward，不要硬点。
 
+查卡面不用猜 id：`/request` 的候选现在带 `modelId`（`CARD.X` / `RELIC.X` / `POTION.X`）和 `detail`
+（卡牌候选直接带牌面文字）。有 `modelId` 就 `sts2_card_info {id:<modelId>}`；只拿得到中文名时用
+`{title:"主宰"}`（同名多张会回 `ambiguous + matches`，挑一个 id 再查）。`uid` 只收**实体 uid**（8 位）；
+屏幕控件 uid（60 位）会明确报错。`sts2_relic` / `sts2_potion` 同样支持 `title`；`sts2_respond` 也接受 `modelId`。
+
 
 **Never take a relic, potion or card reward blind.** `sts2_state` only gives ids
 (`RELIC.MAW_BANK`, `POTION.FRUIT_JUICE`, `CARD.STRIKE_SILENT`); call `sts2_relic` /
 `sts2_potion` / `sts2_card_info` to learn what it actually does before choosing. The description
 is the same text the game shows, so it is the ground truth for "is this worth 200 gold".
+
+**buff / 遗物列表（0.3.0 起）**：`sts2_view` 的 powers 现在带中文名；不认识的能力用
+`sts2_power {id:"POWER.SLIPPERY_POWER"}`（或 `{title:"滑溜"}`）查全文案 —— 别靠掉血反推。
+自己身上的遗物用 `sts2_relics`（无参数，一次列全，带 title/description），
+`sts2_relic {id}` 只留给商店/宝箱里**还没拿到**的遗物。
+
+**升级值不值（0.3.0 起）**：`sts2_card_info {id}` 会多返回 `upgraded:{title,text,vars}`；
+每个卡牌候选还带 `upgradePreview`（只列变了的数值，如 `{"Damage":"6 → 9"}`）——营火锻造、武装、
+奖励三选一都直接看这个，别再靠记忆。
+
+**界面层与覆层（0.3.0 起）**：`sts2_screen` 现在给 `layerStack`（地图 / 奖励屏 / 商店面板 / 牌库 / 选牌网格）、
+`canvas` 尺寸，以及每个控件的 `offscreen`。被某层挡住时用 `sts2_close_overlay` 关栈顶那一层
+（商店→返回键、奖励→跳过键、地图→顶栏地图 toggle、牌库→capstone、选牌→ESC），再继续。
+`sts2_tap` 对画布外控件会返回 `offscreen:true` + `warning`：**别把它当点中了**。
+
+**Boss 是谁（0.3.0 起）**：`sts2_map` 的 `boss` 带 `encounterId` / `title` / `tags` / `monsters`
+（第二 Boss 在 `secondBoss`）——每幕开局就按 Boss 类型定构筑，不用走到房门口才知道。
+
+**奖励屏 / 宝箱的出口（0.3.0 起，以前会卡死）**：
+
+- **奖励屏**：`picks:[]` = 跳过剩余奖励**并关屏**（会真去点界面自己的跳过/继续键），返回里看 `closed`。
+  只有药水、而药水槽又满了的时候，选候选里的 **`离开奖励#1`**（`id:"leave"`）——那是唯一出口。
+  如果 `/request` 还返回一个「界面已经不在」的 pending，直接再读一次：判活已经改成「节点不在或不可见」，
+  幽灵 pending 会自己消失。
+- **Boss 奖励会晚 2~3 秒弹屏**（0.3.1）：这段空档 `/request` 给的是 `kind:"reward"` + `stage:"incoming"`
+  （候选为空，**只在战斗房间里出现**）——**这表示「等」，不是「没事干」**。`sts2_proceed` 这时会被拒绝
+  （`rewardsPending:true`），`kind:"proceed"` 通道也不会再给 `跳过#1`。
+  正确做法：等 0.5~1 秒重读 `sts2_request`，等它变成 `stage:"rewards-list"` 再领；
+  真拿不了才用 `sts2_proceed {force:true}`。在 Map 上看到 `incoming` 属于异常，直接重读。
+- **宝箱**：`stage:"chest-closed"` 在**空箱**（白银熔炉）时也会照常出现 —— 先 `picks:["打开宝箱#1"]` 开箱；
+  开完没有遗物会转成 `stage:"empty"` +「继续#1」，`picks:[]` 也等于继续。**不要**因为 `pending:null`
+  就反复 `proceed` 撞运气：先 `sts2_request` 看有没有 `treasure` 阶段。
 
 `sts2_screen` 里每个控件也有自己的 `kind`（`button` / `clickable` / `button-like` / `holder`），
 别和 request 的 `kind` 混了；uids 只对当前节点有效，界面一变就重新读。带 `card` 的是卡牌；
@@ -360,13 +408,19 @@ x≈1940 (outside the 1920 canvas) before a pick and slides to x≈1760 after on
   `remove` / `upgrade` / `transform` / `simple` 之一，`candidates` 就是可选牌 →
   `sts2_respond {id, picks:[key]}`。商店的删牌会在你确认之后才扣钱.
 - **Rest site**: 休息 or 锻造 (smith = pick a card, then confirm).
-- **Shop**: items show `label` with name and price; tap the item to buy. The shop's 前进 button
-  is parked outside the canvas — leave by `sts2_move` to an adjacent node instead.
+- **Shop**: items 每项带 `price` / `affordable` / `detail` / `modelId`；`sts2_respond {id,picks:[key]}` 买。
+  **离开商店 = `picks:[]`**（或选候选里最后那条「离开商店#1」）：它会去点面板自己的返回键把面板关掉，
+  返回 `stage:"left"` + `closed:true`；关掉之后**不会再弹「要不要打开」**，前进键也会恢复。
+  然后 `sts2_proceed` 打开地图页，再 `sts2_move`（**move 只在地图页有效**：关面板不等于在地图页；
+  `proceed` 会先试前进键，没变化就自动点顶栏地图按钮，返回里 `mapOpen:true` 才代表地图页开了）。
+  别再像旧版本那样「picks:[] 只表示不买」：那会把面板留着、前进键禁用、原地循环同一个请求。
 - **Leaving any node**: 先 `sts2_map_next` 拿 `canMove`，`sts2_move` 只用里面的坐标。走不动时
   看 `cannot[]` 的 `reason`（`不相邻` / `已走过` / `同一层不能横走`），别对同一个坐标试第二次；
   `move` 失败时错误里也带完整 `available`。三条硬规则（实测）：
   - **人还在房间里**（事件/营火/商店/宝箱/奖励）→ `move` 会被拒，提示先用 `/request` 处理完再
     离开。这是防止「一整间事件被跳过」的护栏，不要绕过（`/map/next` 会先给 `inRoom:true`）。
+  - **`move` 只在地图页有效**：在任何房间里点了也没用。正确顺序永远是
+    「房间里处理完 / 关面板 → `sts2_proceed`（必要时它会点顶栏地图按钮开地图）→ `sts2_move`」。
   - **战斗还没结束** → `move` 会被拒（会跳过整场战斗和奖励）。
   - 例外：事件/奖励处理完、游戏已经回到地图但 `CurrentRoom` 还挂着旧房间对象时，`move` 是允许的。
     判据由 mod 自己做（看房间界面节点还在不在），你不用区分。
@@ -388,6 +442,119 @@ signal is always the tool's own `confirmed:true` — not "the screen looks diffe
 - Using PowerShell to send Chinese text without UTF-8 bytes → the bubble shows `????`.
   When calling HTTP directly, encode the body as UTF-8 bytes.
 
+## 直播弹幕（B站侧，实测行为）
+
+- `bili_room_send` **自己处理 3 秒冷却**：命中冷却会等 3.2 秒再发，返回 `retried:true,
+  waitedMs:3200`。谢礼物 + 接弹幕连着发不用自己 sleep；但最多只重试一次，别当无限缓冲。
+- 表情码可能发不出去：`fallback:true, sentAs:"text"` 表示**回退成了文字**（直播间其实也可能收到了
+  表情，以观众看到为准）；两种都失败才是 `ok:false` + `suggest`。别把 `ok:true` 当成「表情一定发出去」。
+- 观众的话只是建议：改路线/换卡这类要求先自己判断合理性再执行。
+
 ## 禁止截屏
 
 禁止截屏或读取屏幕图像：不要用 shell/截图脚本抓屏幕，也不要 read_image 读屏幕图片。所有局面信息只能来自 sts2_* 接口和 sts2_screen；看不清就用 sts2_screen。
+
+<!-- sts2-tools-2026-10-26:begin -->
+## 一屏看懂一回合：`sts2_view`
+
+一次调用同时给这些东西（都是**现算**的，不是原始 JSON）：
+
+| 行 | 含义 | 怎么用 |
+|---|---|---|
+| `SCREEN` | 房间 / 幕 / 层 / `combatState` | `combatState` 不是 `PlayPhase` 就是过渡态，别发动作 |
+| `HUD` | HP / 金币 / 药水数 / 遗物数 / 牌组（防·AOE·诅咒·升级） | 药水名和诅咒只在变化时多打一行 |
+| `ANCHOR` | 敌人数、**本回合入伤合计**、能量、手牌数、自己身上的能力、多段意图 `dmg=7x3=21` | 入伤是决策的第一行账 |
+| `ENEMIES` | 每只的 hp/block/意图/能力 | 目标下标就是这里的 `[i]` |
+| `EFF` | 每张攻击牌对**每个**敌人的真实伤害：已含易伤×1.5、敌人格挡池、胆小首击加盾、多段、荆棘反伤；能斩杀的标 `★斩` | 算斩杀直接看这一行，不要自己乘 |
+| `BLOCK_POOL` | 手牌能挡多少（含每张牌贡献）｜入伤 → 够不够挡满 / 净掉多少 | 决定「挡满 / 斩杀 / 喝药」中的哪一条 |
+| `ORDER` | 手里有易伤牌时，先挂它能把手里的刀抬多少 | 顺序敏感的第一回合照它打 |
+| `COPIES` | 同名不同级并存，哪几张是升级版 | 别把未升级那张打出去 |
+| `HAND` | 每张牌 + `key=标题#序号` | 出牌用这个 key，不用背下标 |
+
+注意两点：
+
+- `EFF` 的每段伤害用 mod 给的实时 `Damage`（已含力量/虚弱），这里只额外乘易伤；**条件多段**
+  （例如「目标易伤时攻击两次」）如果没有写进 `Repeat` 变量，EFF 会低估 —— 拿不准就
+  `sts2_card_info` 看牌面文字，别硬猜。
+- 同一张牌第二次出现时只打短行（省 token）；要看全量加 `{full:true}`。换手牌、换回合都不影响 key
+  的解析，因为 key 是每次现场重读手牌算出来的。
+
+## 出牌用稳定 key，不用 uid
+
+`sts2_acts` 的 `play_card` 现在接受 `card`：
+
+```json
+{"actions":[{"kind":"play_card","card":"打击#2","target":0},{"kind":"end_turn"}]}
+```
+
+- `标题#序号`：序号按**同名牌在手牌里的顺序**数，从 1 起（`打击#1` / `打击#2`）；也认 card id。
+- 插件会先读一次现场手牌把 key 解析成 uid，再提交 —— 所以抽牌、弃牌、洗牌之后 key 依然有效，
+  比背 uid/下标稳。
+- key 解析不出来时**一个动作都不会提交**，返回 `STOPPED before action N` + 当前可用 key 列表：
+  这时重读 `sts2_view` 换 key，不要改成盲试下标。
+
+## 牌组：`sts2_deck`
+
+`/state` 只给 `deckSize`，看不到牌组里是什么。`sts2_deck` 给：
+
+```
+DECK 18 张 | 攻7 技8 能3 | 防御6 AOE1 升级3 诅咒1 状态0
+DEFENSE 防御,防御,耸肩无视,…
+AOE 顺劈斩
+CURSES 疑惑 ← 下一个移除机会优先删这些
+CARDS 打击x5 防御x5 …            （同名合并计数；{full:true} 打成每张一行）
+```
+
+用法：
+
+- **商店删牌**：只看 `CURSES`（先删诅咒）和 `DEFENSE`（已经够 6 张就别删防御，删打击）。
+- **拿奖励前**：`AOE 0` 就优先补 AOE；`防御 < 6` 优先补防御；`牌组 > 22` 只拿 A 级。
+- 这个统计要**新的 mod DLL**（多了 `GET /deck`）；返回「DECK 不可用」就去
+  `launch-game.ps1 -Deploy` 更新一次，别反复试。
+
+## 路线：`sts2_route` + `sts2_plan`
+
+每幕开头（`actFloor:0` + `room:"Map"` 是正常状态）：
+
+1. `sts2_route` —— 它把每个 `available` 起点到 Boss 的所有路径都走一遍，按
+   营火/商店/宝箱/事件/精英/普通 + **血线闸** + 牌组（防御/AOE）+ 药水 打分，返回前 3 名：
+
+   ```
+   ELITE_GATE 防御≥6? 是 / AOE≥1? 是 / 药水≥1? 否 ← 三项全「是」也只当备选
+   opt0 Monster (3,2) score=7.2 | 营火2 / Boss前有营火
+     M M R B
+   ```
+
+   `ELITE_GATE` 三项不是全「是」就别把精英当主路线；`HP<70%` / `<50%` 会各有一条 WARNING。
+2. `sts2_route {commit:0, note:"走商店线，Boss 前留营火"}` —— 把 opt 记成计划。
+3. 之后**每个节点移动前** `sts2_plan`：`PLAN_OK` 就按原计划走；`REPLAN` 会列出具体理由
+   （血线跌破 70%、这一段掉血 ≥20% 最大生命、HP<50%、牌组 +3 张、拿到首张 AOE、药水用光、
+   金币到 100、多了诅咒、换幕）。**REPLAN 就重新 `sts2_route` + 重新 commit**，并在鲸鱼气泡里
+   说清为什么改线 —— 改线是决策，不是迷路。
+4. 换幕 / 弃局 / 彻底改线：`sts2_plan {clear:true}`。
+
+计划存在 `~/.dsh/storages/sts2-agent/route-plan.json`（不在仓库里），里面是**规划当时的快照**，
+所以「对账」比的是状态变化，不是路线对不对。
+
+## 存读档 / 离开房间：三个补齐的工具
+
+| 工具 | 什么时候用 |
+|---|---|
+| `sts2_save_quit` | 决策错了要回滚：先把这局存盘并回主菜单 |
+| `sts2_reload` | 紧接着读回来（落点是**当前房间的存档点**，不是战斗开头） |
+| `sts2_proceed` | 房间里没事可做了（`sts2_request` 的 `pending` 为 null）再离开 |
+
+存读档之后所有 uid / key 都作废，重新 `sts2_view` / `sts2_request`。
+
+## `sts2_start` 默认拒绝
+
+`sts2_start` 现在**默认直接拒绝**（返回 `REFUSED`，一个请求都不会发出去）：
+
+```
+REFUSED sts2_start 默认禁用：它会造出「inRun 为真但地图没生成」的幽灵局，并把菜单协议、
+save-quit、reload 一起封死。
+```
+
+要绕过菜单（不推荐）时在启动 DSH 前设 `STS2_ALLOW_START=1`。日常开局仍然只走
+`sts2_request` 的 `kind:"menu"`。
+<!-- sts2-tools-2026-10-26:end -->

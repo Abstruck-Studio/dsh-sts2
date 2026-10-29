@@ -1,0 +1,47 @@
+{
+  "_note": "Incremental patches for ~/.dsh/skills/slay-the-spire-2/SKILL.md. Applied by scripts/apply-skill-updates.ps1; each patch carries a marker unique to its patched form, so re-running is a no-op (markers must NOT appear in skill/APPEND.md).",
+  "patches": [
+    {
+      "id": "view-step2",
+      "marker": "进战斗后改用",
+      "find": "2. `sts2_state`，然后 `sts2_request` —— 停在菜单/开始界面时用 `kind:\"menu\"` 走完，不点坐标。",
+      "replace": "2. `sts2_state`，然后 `sts2_request` —— 停在菜单/开始界面时用 `kind:\"menu\"` 走完，不点坐标。\n   进战斗后改用 `sts2_view`（一次给出 ANCHOR / EFF / BLOCK_POOL / ORDER / COPIES / 手牌 key），\n   别拿原始 `/state` 自己心算伤害。"
+    },
+    {
+      "id": "fastpath-play-turn",
+      "marker": "用 `sts2_view` 给的 `标题#序号`",
+      "find": "| Play a turn | `sts2_acts({actions:[{play_card,uid,target}, … , {end_turn}]})` — one call, 2–4 cards, verify `energy` in the returned turn |",
+      "replace": "| Play a turn | `sts2_acts({actions:[{kind:\"play_card\",card:\"打击#2\",target:0}, …, {kind:\"end_turn\"}]})` — one call, 2–4 cards；`card` 用 `sts2_view` 给的 `标题#序号`（比 uid/下标稳），verify `energy` in the returned turn |"
+    },
+    {
+      "id": "fastpath-route",
+      "marker": "先 `sts2_plan`（`PLAN_OK` 走 / `REPLAN` 重排）",
+      "find": "| 看整张图 / 定路线 | 每幕只做一次：`sts2_map` 拿全图 → 自己按 `children/parents` 定路线并说出来；之后每步 `sts2_map_next` 取 `canMove` |",
+      "replace": "| 看整张图 / 定路线 | 每幕开头一次：`sts2_route`（直接给 opt 排名 + 符号序列 + `ELITE_GATE`）→ `sts2_route {commit:<opt>, note:\"…\"}` 记计划 → 之后每个节点先 `sts2_plan`（`PLAN_OK` 走 / `REPLAN` 重排）；`canMove` 永远来自 `sts2_map_next` |"
+    },
+    {
+      "id": "save-quit-row",
+      "marker": "`sts2_save_quit`（= `POST /save-quit`）",
+      "find": "| 存盘并回主菜单 | `POST /save-quit` → `{ok,saved,room:\"MainMenu\",hasRunSave,wasRoom,wasFloor,…}` |",
+      "replace": "| 存盘并回主菜单 | `sts2_save_quit`（= `POST /save-quit`）→ `{ok,saved,room:\"MainMenu\",hasRunSave,wasRoom,wasFloor,…}` |"
+    },
+    {
+      "id": "reload-row",
+      "marker": "`sts2_reload`（= `POST /reload`）",
+      "find": "| 读档继续 | `POST /reload` → `{ok,inRun:true,how:\"continue-button\",…}` |",
+      "replace": "| 读档继续 | `sts2_reload`（= `POST /reload`）→ `{ok,inRun:true,how:\"continue-button\",…}` |"
+    },
+    {
+      "id": "push-vs-view",
+      "marker": "follow the push with ONE `sts2_view`",
+      "find": "So the loop is: receive a push → decide → call the action tools → wait for the next push.\nOnly call `sts2_state` when you genuinely lost track (e.g. after a long tool detour), not every\nturn — a stale read is worse than the pushed snapshot because it may describe an older board.",
+      "replace": "So the loop is: receive a push → decide → call the action tools → wait for the next push.\nOnly call `sts2_state` when you genuinely lost track (e.g. after a long tool detour), not every\nturn — a stale read is worse than the pushed snapshot because it may describe an older board.\n\nThe push has no damage math. When the turn needs the numbers (multiple enemies, 易伤/多段/斩杀线,\nor \"can my hand block this\"), follow the push with ONE `sts2_view`: it returns the incoming total,\nper-card damage against each enemy, `BLOCK_POOL`, `ORDER` and `COPIES`. Use `sts2_state` only when\nyou need raw JSON fields that `sts2_view` does not print."
+    },
+    {
+      "id": "start-gate",
+      "marker": "只有启动 DSH 前设了 `STS2_ALLOW_START=1` 才会放行",
+      "find": "`POST /start`（`sts2_start` 工具）**现在直接返回错误，而且不会造任何东西**。原因（实测）：",
+      "replace": "`POST /start`（`sts2_start` 工具）**默认直接返回 `REFUSED`，一个请求都不会发出去**\n（只有启动 DSH 前设了 `STS2_ALLOW_START=1` 才会放行）。原因（实测）："
+    }
+  ]
+}

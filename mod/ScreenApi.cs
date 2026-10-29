@@ -109,11 +109,38 @@ public static class ScreenApi
                 items.Add(item);
             }
 
+            // 画布外的控件标出来：agent 以前分不清「叠放的另一层」和「同一层的屏幕外元素」。
+            var vpSize = new Vector2(1920, 1080);
+            try
+            {
+                if (Engine.GetMainLoop() is SceneTree st)
+                {
+                    var size = st.Root.Size;
+                    vpSize = new Vector2(size.X, size.Y);
+                }
+            }
+            catch { }
+            foreach (var raw in items)
+            {
+                if (raw is not Dictionary<string, object> item) continue;
+                try
+                {
+                    var x = Convert.ToDouble(item.TryGetValue("x", out var xv) ? xv : 0);
+                    var y = Convert.ToDouble(item.TryGetValue("y", out var yv) ? yv : 0);
+                    var w = Convert.ToDouble(item.TryGetValue("w", out var wv) ? wv : 0);
+                    var h = Convert.ToDouble(item.TryGetValue("h", out var hv) ? hv : 0);
+                    if (x + w < 0 || y + h < 0 || x > vpSize.X || y > vpSize.Y) item["offscreen"] = true;
+                }
+                catch { }
+            }
+
             return new Dictionary<string, object>
             {
                 ["ok"] = true,
                 ["screen"] = CurrentScreen(),
                 ["screenType"] = screenType,
+                ["layerStack"] = LayerStack(),
+                ["canvas"] = new Dictionary<string, object> { ["w"] = vpSize.X, ["h"] = vpSize.Y },
                 ["count"] = items.Count,
                 ["items"] = items,
             };
@@ -197,7 +224,16 @@ public static class ScreenApi
             if (proceed == null) return Fail("当前界面没有 NProceedButton（这个房间不是用前进按钮离开的）");
             if (!proceed.IsInsideTree()) return Fail("NProceedButton 不在场景树里");
             if (!proceed.Visible) return Fail("NProceedButton 当前不可见");
-            if (!proceed.IsEnabled) return Fail("NProceedButton 当前不可用（条件还没满足）");
+            if (!proceed.IsEnabled)
+            {
+                // 商店面板开着时前进键是禁用的（面板是模态的）。给一句能直接照做的话，
+                // 别让 agent 以为「条件还没满足」只能干等。
+                var shopOpen = GameApi.ShopInventoryOpen();
+                return Fail("NProceedButton 当前不可用（条件还没满足）"
+                    + (shopOpen
+                        ? "：商店面板还开着 → 先 sts2_respond picks:[]（或选「离开商店#1」）关掉面板，再推进"
+                        : ""));
+            }
 
             proceed.ForceClick();
             BridgeLog.Info("proceed via NProceedButton.ForceClick");
@@ -212,6 +248,213 @@ public static class ScreenApi
         {
             return Fail(e.Message);
         }
+    }
+
+    /// <summary>
+    /// 打开地图页：点顶栏的 <c>NTopBarMapButton</c>（玩家开地图就是点它）。
+    /// `move` 只在地图页有效，所以离开房间之后的正确顺序是「关面板 → 开地图页 → move」。
+    /// </summary>
+    internal static Dictionary<string, object> OpenMapPage()
+    {
+        try
+        {
+            if (Engine.GetMainLoop() is not SceneTree tree) return Fail("没有场景树");
+
+            var map = MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen.Instance;
+            if (map != null && GodotObject.IsInstanceValid(map) && map.IsOpen)
+                return new Dictionary<string, object> { ["ok"] = true, ["method"] = "already-open" };
+
+            MegaCrit.Sts2.Core.Nodes.TopBar.NTopBarMapButton button = null;
+            var stack = new Stack<Node>();
+            stack.Push(tree.Root);
+            var visited = 0;
+            while (stack.Count > 0 && visited++ < 20000)
+            {
+                var node = stack.Pop();
+                if (node is MegaCrit.Sts2.Core.Nodes.TopBar.NTopBarMapButton b)
+                {
+                    button = b;
+                    break;
+                }
+                foreach (var child in node.GetChildren()) stack.Push(child);
+            }
+
+            if (button == null) return Fail("没有 NTopBarMapButton（顶栏地图按钮）");
+            if (!button.IsInsideTree()) return Fail("NTopBarMapButton 不在场景树里");
+            try { if (!button.IsVisibleInTree()) return Fail("NTopBarMapButton 不可见"); } catch { }
+
+            button.ForceClick();
+            BridgeLog.Info("open map via NTopBarMapButton.ForceClick");
+            return new Dictionary<string, object> { ["ok"] = true, ["method"] = "NTopBarMapButton.ForceClick" };
+        }
+        catch (Exception e)
+        {
+            return Fail(e.Message);
+        }
+    }
+
+    /// <summary>地图页是不是开着（给 /proceed 的两段式确认用）。</summary>
+    internal static bool IsMapOpen()
+    {
+        try
+        {
+            var map = MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen.Instance;
+            return map != null && GodotObject.IsInstanceValid(map) && map.IsOpen;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>当前房间名（给 /proceed 判断「点了到底有没有变化」）。</summary>
+    internal static string CurrentRoomName()
+    {
+        try
+        {
+            var room = MegaCrit.Sts2.Core.Runs.RunManager.Instance?.DebugOnlyGetState()?.CurrentRoom;
+            return room?.RoomType.ToString() ?? "";
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>
+    /// 栈上有哪些「界面层」（按场景树顺序，不是严格 z 序）：地图 / 奖励屏 / 商店面板 / 牌库 / 选牌网格。
+    /// 只报**可见且确实打开**的，压缩掉不可见的旧节点。
+    /// </summary>
+    internal static List<string> LayerStack()
+    {
+        var layers = new List<string>();
+        try
+        {
+            if (Engine.GetMainLoop() is not SceneTree tree) return layers;
+            var stack = new Stack<Node>();
+            stack.Push(tree.Root);
+            var visited = 0;
+            while (stack.Count > 0 && visited++ < 40000)
+            {
+                var node = stack.Pop();
+                var name = LayerName(node);
+                if (name != null && !layers.Contains(name)) layers.Add(name);
+                foreach (var child in node.GetChildren()) stack.Push(child);
+            }
+        }
+        catch { }
+        return layers;
+    }
+
+    private static string LayerName(Node node)
+    {
+        try
+        {
+            if (node is not CanvasItem item || !item.IsInsideTree() || !item.IsVisibleInTree()) return null;
+            if (node is MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen map && map.IsOpen) return "NMapScreen";
+            if (node is MegaCrit.Sts2.Core.Nodes.Screens.NRewardsScreen) return "NRewardsScreen";
+            if (node is MegaCrit.Sts2.Core.Nodes.Screens.Shops.NMerchantInventory inv && inv.IsOpen) return "NMerchantInventory";
+            if (node is MegaCrit.Sts2.Core.Nodes.Screens.NDeckViewScreen) return "NDeckViewScreen";
+            if (node is MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.NCardGridSelectionScreen) return "NCardGridSelectionScreen";
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// 关掉栈顶那一层覆层（地图 / 奖励屏 / 商店面板 / 牌库）。走游戏自己的入口，不点坐标：
+    /// 商店→面板返回键、奖励屏→它自己的跳过/继续键、地图→再点一次顶栏地图按钮、牌库→capstone.Close()。
+    /// </summary>
+    internal static Dictionary<string, object> CloseOverlay()
+    {
+        try
+        {
+            if (Engine.GetMainLoop() is not SceneTree tree) return Fail("没有场景树");
+            var layers = LayerStack();
+            if (layers.Count == 0) return Fail("没有检测到开着的覆层（layerStack 为空）");
+
+            var top = layers[layers.Count - 1];
+            if (top == "NMerchantInventory")
+            {
+                var inv = FindFirstNode<MegaCrit.Sts2.Core.Nodes.Screens.Shops.NMerchantInventory>(tree.Root);
+                var back = inv == null ? null : FindBackButton(inv);
+                if (back != null)
+                {
+                    back.ForceClick();
+                    return OkResult("NMerchantInventory", "back-button");
+                }
+                return Fail("商店面板开着，但没找到它的返回键");
+            }
+            if (top == "NRewardsScreen")
+            {
+                var screen = FindFirstNode<MegaCrit.Sts2.Core.Nodes.Screens.NRewardsScreen>(tree.Root);
+                var btn = screen == null ? null : RequestApi.FindRewardsLeaveControl(screen);
+                if (btn != null)
+                {
+                    btn.ForceClick();
+                    return OkResult("NRewardsScreen", "skip-button");
+                }
+                return Fail("奖励屏开着，但没找到跳过/继续键");
+            }
+            if (top == "NMapScreen")
+            {
+                var r = OpenMapPage();        // 顶栏地图按钮是 toggle：再点一次就关
+                return r;
+            }
+            if (top == "NDeckViewScreen")
+            {
+                var container = FindFirstNode<MegaCrit.Sts2.Core.Nodes.Screens.Capstones.NCapstoneContainer>(tree.Root);
+                if (container != null)
+                {
+                    container.Close();
+                    return OkResult("NDeckViewScreen", "capstone-close");
+                }
+                return Fail("牌库开着，但没有 NCapstoneContainer");
+            }
+            if (top == "NCardGridSelectionScreen")
+            {
+                PressKey(4194305);            // ESC：让游戏自己取消这层选择界面
+                return OkResult("NCardGridSelectionScreen", "escape");
+            }
+            return Fail("不知道怎么关这一层：" + top);
+        }
+        catch (Exception e) { return Fail(e.Message); }
+    }
+
+    private static Dictionary<string, object> OkResult(string layer, string how) => new()
+    {
+        ["ok"] = true,
+        ["closed"] = layer,
+        ["how"] = how,
+        ["layerStack"] = LayerStack(),
+    };
+
+    private static T FindFirstNode<T>(Node root) where T : Node
+    {
+        if (root == null) return null;
+        var stack = new Stack<Node>();
+        stack.Push(root);
+        var visited = 0;
+        while (stack.Count > 0 && visited++ < 40000)
+        {
+            var node = stack.Pop();
+            if (node is T hit) return hit;
+            foreach (var child in node.GetChildren()) stack.Push(child);
+        }
+        return null;
+    }
+
+    /// <summary>某棵子树里第一个可见的 NBackButton（面板自己的返回键）。</summary>
+    internal static NClickableControl FindBackButton(Node root)
+    {
+        if (root == null) return null;
+        var stack = new Stack<Node>();
+        stack.Push(root);
+        var visited = 0;
+        while (stack.Count > 0 && visited++ < 40000)
+        {
+            var node = stack.Pop();
+            if (node is MegaCrit.Sts2.Core.Nodes.CommonUi.NBackButton back)
+            {
+                try { if (back.IsVisibleInTree()) return back; } catch { }
+            }
+            foreach (var child in node.GetChildren()) stack.Push(child);
+        }
+        return null;
     }
 
     /// <summary>Press and release a key (by Godot keycode) on the game viewport.</summary>
@@ -286,6 +529,10 @@ public static class ScreenApi
                         ["method"] = "edge",
                         ["x"] = p2.X,
                         ["y"] = p2.Y,
+                        // 画布外的按钮贴边点不一定生效（实测两次 ok 但什么都没发生）。
+                        // 不再假装成功：把事实标出来，让 agent 知道要自己确认结果。
+                        ["offscreen"] = true,
+                        ["warning"] = "控件在画布外，这次贴边点击可能无效；点完请重读 sts2_request / sts2_view 确认",
                     };
                 }
 

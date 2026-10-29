@@ -10,7 +10,7 @@ namespace Sts2AgentBridge;
 
 /// <summary>
 /// Pushes a compact combat snapshot the moment the player can act again — new turn, or after
-/// the action queue settles. The caller forwards it into the session, so the agent
+/// the action queue settles. The live director forwards it into the session, so the agent
 /// never has to poll /state and can never act on a stale board.
 /// </summary>
 public static class StatePush

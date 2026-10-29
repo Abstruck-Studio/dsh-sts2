@@ -87,6 +87,68 @@ public static class DataApi
         try { act = state.Act?.Id?.ToString(); } catch { }
 
         var boss = graph.Boss;
+
+        // Boss 身份（问题 7）：光有坐标不够，构筑要提前知道是谁。
+        // 数据来自 ActModel.BossEncounter / SecondBossEncounter（游戏自己的选择结果，不是猜的）。
+        Dictionary<string, object> bossDto = null;
+        if (boss != null)
+        {
+            bossDto = new Dictionary<string, object>
+            {
+                ["col"] = boss.Col,
+                ["row"] = boss.Row,
+                ["type"] = "Boss",
+            };
+            try
+            {
+                var actModel = state.Act;
+                var encounter = actModel?.BossEncounter;
+                if (encounter != null)
+                {
+                    bossDto["encounterId"] = encounter.Id?.ToString();
+                    bossDto["title"] = SafeText(encounter.Title);
+                    var tags = new List<object>();
+                    try
+                    {
+                        if (encounter.Tags != null)
+                            foreach (var tag in encounter.Tags) tags.Add(tag.ToString());
+                    }
+                    catch { }
+                    if (tags.Count > 0) bossDto["tags"] = tags;
+
+                    // 这一场 Boss 会出哪些怪（还没生成时游戏自己会返回空列表，不编）。
+                    var monsters = new List<object>();
+                    try
+                    {
+                        if (encounter.AllPossibleMonsters != null)
+                            foreach (var monster in encounter.AllPossibleMonsters)
+                            {
+                                string name = null;
+                                try { name = SafeText(monster?.Title); } catch { }
+                                if (string.IsNullOrEmpty(name)) continue;
+                                monsters.Add(new Dictionary<string, object>
+                                {
+                                    ["id"] = monster.Id?.ToString(),
+                                    ["title"] = name,
+                                });
+                            }
+                    }
+                    catch { }
+                    if (monsters.Count > 0) bossDto["monsters"] = monsters;
+                }
+
+                if (actModel?.HasSecondBoss == true && actModel.SecondBossEncounter != null)
+                {
+                    bossDto["secondBoss"] = new Dictionary<string, object>
+                    {
+                        ["encounterId"] = actModel.SecondBossEncounter.Id?.ToString(),
+                        ["title"] = SafeText(actModel.SecondBossEncounter.Title),
+                    };
+                }
+            }
+            catch { }
+        }
+
         return Ok(new Dictionary<string, object>
         {
             ["act"] = act,
@@ -95,7 +157,7 @@ public static class DataApi
             ["current"] = currentCoord == null ? null : new { col = currentCoord.Value.col, row = currentCoord.Value.row },
             ["rows"] = graph.Rows,
             ["cols"] = graph.Cols,
-            ["boss"] = boss == null ? null : new { col = boss.Col, row = boss.Row, type = "Boss" },
+            ["boss"] = bossDto,
             ["available"] = available,
             ["points"] = points,
             ["legend"] = MapApi.Legend(),
@@ -145,35 +207,119 @@ public static class DataApi
         }
     }
 
-    /// <summary>Full detail for one card. Pass uid to describe the exact hand card the agent is looking at.</summary>
-    public static Dictionary<string, object> Card(string id, int? uid)
+    /// <summary>
+    /// Full detail for one card. Prefer <paramref name="id"/>; otherwise describe the exact hand/deck
+    /// card by <paramref name="uid"/>, or resolve a Chinese <paramref name="title"/> (selection
+    /// requests only expose titles, so this is the bridge from「主宰」to CARD.…).
+    /// </summary>
+    public static Dictionary<string, object> Card(string id, long? uid, string title = null)
     {
-        if (uid is { } hash)
+        // 1) id 优先：显式给了 id 就按 id 查，不和标题/uid 混。
+        if (!string.IsNullOrWhiteSpace(id))
         {
-            var card = FindByUid(hash);
-            if (card == null) return Fail($"no card with uid {hash} in hand or deck");
+            try
+            {
+                var found = ModelDb.GetByIdOrNull<CardModel>(ModelId.Deserialize(id));
+                if (found == null) return Fail($"no card {id}");
+                return Detail(found);
+            }
+            catch (Exception e)
+            {
+                return Fail(e.Message);
+            }
+        }
+
+        // 2) uid：卡牌实体 uid 是 RuntimeHelpers.GetHashCode（int）。界面控件 uid 是 60 位 ulong，
+        //    两者不是一个命名空间；传错了要说清楚，而不是回一句误导的「missing id or uid」。
+        if (uid is { } raw)
+        {
+            if (raw > int.MaxValue || raw < int.MinValue)
+            {
+                return Fail($"uid {raw} 看起来是界面控件 id（ulong），不是卡牌实体 uid。" +
+                            "实体 uid 是 8 位整数，见 /state 的 players[0].hand[].uid 或 /deck 的 cards[].uid；" +
+                            "只有标题时用 title= 查。");
+            }
+            var card = FindByUid((int)raw);
+            if (card == null)
+            {
+                return Fail($"uid {raw} 不在手牌/牌库里（读档或换牌后 uid 会变，重新读 /state；" +
+                            "只有标题时用 title= 查）。");
+            }
             Preview(card);
             return Detail(card);
         }
 
-        if (string.IsNullOrWhiteSpace(id)) return Fail("missing id or uid");
+        // 3) title：选牌/奖励界面只给中文名，按标题反查模型（手牌 → 牌库 → 全部卡池）。
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            var matches = CardsByTitle(title);
+            if (matches.Count == 0) return Fail($"no card titled 「{title}」（已搜手牌 / 牌库 / 全部卡池）");
+            if (matches.Count == 1) return Detail(matches[0]);
+
+            return Ok(new Dictionary<string, object>
+            {
+                ["ambiguous"] = true,
+                ["title"] = title,
+                ["note"] = "同名多张（升级版/衍生牌），挑一个 id 再查一次",
+                ["matches"] = matches.Take(8).Select(c => new Dictionary<string, object>
+                {
+                    ["id"] = c.Id?.ToString(),
+                    ["title"] = c.Title,
+                    ["upgraded"] = c.IsUpgraded,
+                    ["type"] = c.Type.ToString(),
+                    ["cost"] = c.EnergyCost?.GetAmountToSpend() ?? c.EnergyCost?.Canonical ?? 0,
+                }).ToList(),
+            });
+        }
+
+        return Fail("missing id / uid / title（三种至少给一个）");
+    }
+
+    /// <summary>按中文名找牌：手牌 → 牌库 → 全部卡池（AllCards）。同名多张都返回。</summary>
+    private static List<CardModel> CardsByTitle(string title)
+    {
+        var list = new List<CardModel>();
+        var seen = new HashSet<int>();
+        void Add(CardModel c)
+        {
+            if (c == null) return;
+            if (!string.Equals((c.Title ?? "").Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase)) return;
+            if (seen.Add(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(c))) list.Add(c);
+        }
 
         try
         {
-            var found = ModelDb.GetByIdOrNull<CardModel>(ModelId.Deserialize(id));
-            if (found == null) return Fail($"no card {id}");
-            return Detail(found);
+            var state = RunManager.Instance?.DebugOnlyGetState();
+            foreach (var player in state?.Players ?? Enumerable.Empty<Player>())
+            {
+                foreach (var c in player.PlayerCombatState?.Hand?.Cards ?? Enumerable.Empty<CardModel>()) Add(c);
+                foreach (var c in player.Deck?.Cards ?? Enumerable.Empty<CardModel>()) Add(c);
+            }
         }
-        catch (Exception e)
+        catch { }
+
+        if (list.Count == 0)
         {
-            return Fail(e.Message);
+            try { foreach (var c in ModelDb.AllCards) Add(c); } catch { }
         }
+        return list;
     }
 
     /// <summary>遗物/药水简介：奖励和商店里选东西时必须先看这个。</summary>
-    public static Dictionary<string, object> Relic(string id)
+    public static Dictionary<string, object> Relic(string id, string title = null)
     {
-        if (string.IsNullOrWhiteSpace(id)) return Fail("missing relic id");
+        if (string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(title))
+        {
+            try
+            {
+                var hit = ModelDb.AllRelics.FirstOrDefault(r =>
+                    string.Equals((SafeText(r.Title) ?? "").Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase));
+                if (hit == null) return Fail($"no relic titled 「{title}」");
+                id = hit.Id?.ToString();
+            }
+            catch (Exception e) { return Fail(e.Message); }
+        }
+        if (string.IsNullOrWhiteSpace(id)) return Fail("missing relic id / title");
         try
         {
             var model = ModelDb.GetByIdOrNull<RelicModel>(ModelId.Deserialize(id));
@@ -188,9 +334,20 @@ public static class DataApi
         catch (Exception e) { return Fail(e.Message); }
     }
 
-    public static Dictionary<string, object> Potion(string id)
+    public static Dictionary<string, object> Potion(string id, string title = null)
     {
-        if (string.IsNullOrWhiteSpace(id)) return Fail("missing potion id");
+        if (string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(title))
+        {
+            try
+            {
+                var hit = ModelDb.AllPotions.FirstOrDefault(p =>
+                    string.Equals((SafeText(p.Title) ?? "").Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase));
+                if (hit == null) return Fail($"no potion titled 「{title}」");
+                id = hit.Id?.ToString();
+            }
+            catch (Exception e) { return Fail(e.Message); }
+        }
+        if (string.IsNullOrWhiteSpace(id)) return Fail("missing potion id / title");
         try
         {
             var model = ModelDb.GetByIdOrNull<PotionModel>(ModelId.Deserialize(id));
@@ -200,6 +357,77 @@ public static class DataApi
                 ["id"] = model.Id?.ToString(),
                 ["title"] = SafeText(model.Title),
                 ["description"] = AnyText(model, "DynamicDescription", "Description"),
+            });
+        }
+        catch (Exception e) { return Fail(e.Message); }
+    }
+
+    /// <summary>
+    /// 能力 / buff 说明：`POWER.XXX → 标题 + 文案`。数据源是游戏自己的 <c>PowerModel</c>
+    /// （Title / Description / SmartDescription），和 /card、/relic、/potion 同一套写法。
+    /// </summary>
+    public static Dictionary<string, object> Power(string id, string title = null)
+    {
+        try
+        {
+            PowerModel model = null;
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                model = ModelDb.GetByIdOrNull<PowerModel>(ModelId.Deserialize(id));
+            }
+            else if (!string.IsNullOrWhiteSpace(title))
+            {
+                model = ModelDb.AllPowers.FirstOrDefault(p =>
+                    string.Equals((SafeText(p.Title) ?? "").Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (model == null)
+                return Fail(string.IsNullOrWhiteSpace(id)
+                    ? $"no power titled 「{title}」"
+                    : $"no power {id}");
+
+            return Ok(new Dictionary<string, object>
+            {
+                ["id"] = model.Id?.ToString(),
+                ["title"] = SafeText(model.Title),
+                ["description"] = SafeText(model.Description) ?? SafeText(model.SmartDescription),
+            });
+        }
+        catch (Exception e) { return Fail(e.Message); }
+    }
+
+    /// <summary>
+    /// 玩家当前身上的全部遗物（带中文名与效果），和 /potions 同构。
+    /// 以前只有单查，10 件遗物要 11 次调用。
+    /// </summary>
+    public static Dictionary<string, object> Relics()
+    {
+        try
+        {
+            var rm = RunManager.Instance;
+            if (rm == null || !rm.IsInProgress) return Fail("not in run");
+            var state = rm.DebugOnlyGetState();
+            var player = state?.Players?.FirstOrDefault();
+            if (player == null) return Fail("no players");
+
+            var list = new List<object>();
+            var index = 0;
+            foreach (var relic in player.Relics)
+            {
+                if (relic == null) continue;
+                list.Add(new Dictionary<string, object>
+                {
+                    ["index"] = index++,
+                    ["id"] = relic.Id?.ToString(),
+                    ["title"] = SafeText(relic.Title),
+                    ["description"] = AnyText(relic, "DynamicDescription", "Description", "EventDescription"),
+                });
+            }
+
+            return Ok(new Dictionary<string, object>
+            {
+                ["count"] = list.Count,
+                ["relics"] = list,
             });
         }
         catch (Exception e) { return Fail(e.Message); }
@@ -305,8 +533,13 @@ public static class DataApi
         }
     }
 
-    private static Dictionary<string, object> Detail(CardModel card)
+    /// <summary>
+    /// 卡面文字（动态数值已展开、BBCode 已剥）。`/card` 与 `/request` 候选的 detail 共用这一套，
+    /// 免得同一个模型在两条路上给出两种说法。
+    /// </summary>
+    internal static string CardText(CardModel card)
     {
+        if (card == null) return null;
         string text = null;
         try
         {
@@ -323,7 +556,17 @@ public static class DataApi
         }
         catch { }
 
-        return Ok(new Dictionary<string, object>
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"\[[^\[\]]{1,24}\]", string.Empty);
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
+        return text;
+    }
+
+    private static Dictionary<string, object> Detail(CardModel card)
+    {
+        var text = CardText(card);
+
+        var dto = new Dictionary<string, object>
         {
             ["id"] = card.Id?.ToString(),
             ["uid"] = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(card),
@@ -334,7 +577,72 @@ public static class DataApi
             ["rarity"] = card.Rarity.ToString(),
             ["target"] = card.TargetType.ToString(),
             ["keywords"] = card.Keywords?.Select(k => k.ToString()).ToList(),
-        });
+            ["isUpgraded"] = card.IsUpgraded,
+        };
+
+        // 升级后是什么样（营火锻造 / 武装这类决策要用）。克隆再升，绝不动游戏里的本体。
+        var up = UpgradedCopy(card);
+        if (up != null)
+        {
+            dto["upgraded"] = new Dictionary<string, object>
+            {
+                ["title"] = up.Title,
+                ["text"] = CardText(up),
+                ["vars"] = VarsMap(up),
+            };
+        }
+
+        return Ok(dto);
+    }
+
+    /// <summary>升级后的**副本**（绝不改游戏里的那张本体）。已满级/拿不到就 null。</summary>
+    internal static CardModel UpgradedCopy(CardModel card)
+    {
+        if (card == null) return null;
+        try
+        {
+            if (card.IsUpgraded || card.CurrentUpgradeLevel >= card.MaxUpgradeLevel) return null;
+            var clone = card.ToMutable();
+            if (clone == null || ReferenceEquals(clone, card)) clone = card.CreateClone();
+            if (clone == null || ReferenceEquals(clone, card)) return null;
+            clone.UpgradeInternal();
+            clone.FinalizeUpgradeInternal();
+            return clone;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>升级前后的动态数值差（只列变了的，紧凑）：{ "Damage": "6 → 9" }。</summary>
+    internal static Dictionary<string, object> UpgradeDelta(CardModel card)
+    {
+        var up = UpgradedCopy(card);
+        if (up == null) return null;
+        try
+        {
+            var before = VarsMap(card);
+            var after = VarsMap(up);
+            var delta = new Dictionary<string, object>();
+            foreach (var kv in after)
+            {
+                before.TryGetValue(kv.Key, out var old);
+                if (kv.Value != old) delta[kv.Key] = $"{old} → {kv.Value}";
+            }
+            return delta.Count > 0 ? delta : null;
+        }
+        catch { return null; }
+    }
+
+    private static Dictionary<string, int> VarsMap(CardModel card)
+    {
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (card?.DynamicVars != null)
+                foreach (var v in card.DynamicVars.Values)
+                    if (!string.IsNullOrEmpty(v.Name)) map[v.Name] = v.IntValue;
+        }
+        catch { }
+        return map;
     }
 
     private static Dictionary<string, object> Ok(Dictionary<string, object> payload)
